@@ -24,8 +24,9 @@ pub mod ramdisk {
     /// The commands install scripts written for other recoveries run that
     /// Skyward answers itself: 7za, avbctl, resetprop and zstd, which a
     /// stock recovery does not carry, and unzip, whose stock version holds
-    /// all that `-p` takes out in memory. Each is a link to the recovery
-    /// service binary beside it, which runs the command it is started as.
+    /// all that `-p` takes out in memory. Stock bases get links to the
+    /// recovery service binary. A base's native resetprop is retained for
+    /// device-selection scripts that replace read-only properties.
     pub const COMMANDS: [&str; 5] = ["system/bin/7za", "system/bin/avbctl", "system/bin/resetprop", "system/bin/unzip", "system/bin/zstd"];
     /// The first property file init loads in recovery mode.
     pub const PROP_DEFAULT: &str = "prop.default";

@@ -147,12 +147,7 @@ fn main() -> Result<()> {
                 None => rd.replace(paths::RECOVERY, read(&binary)?)?,
             }
             let (_, recovery) = service.rsplit_once('/').expect("the recovery program is in a folder");
-            for command in paths::COMMANDS {
-                // A TWRP base can carry regular avbctl/resetprop binaries;
-                // replace them with the same links used by a stock base.
-                rd.drop_at(command);
-                rd.link(command, recovery)?;
-            }
+            install_commands(&mut rd, recovery)?;
             ensure!(!cfg.device.ab || system_init.is_some(), "an A/B device requires --system-init");
             if let Some(system_init) = &system_init {
                 rd.add(paths::SYSTEM_INIT, 0o755, read(system_init)?)?;
@@ -357,6 +352,19 @@ fn without_legacy_mtp(text: &str) -> Option<String> {
     gone.then(|| kept.join("\n") + "\n")
 }
 
+/// Keep a base's native property editor: device-selection scripts use it
+/// to replace read-only identities, which Skyward's resetprop cannot do.
+fn install_commands(rd: &mut Ramdisk, recovery: &str) -> Result<()> {
+    for command in paths::COMMANDS {
+        if command == "system/bin/resetprop" && rd.find(command).is_some_and(|entry| entry.data.starts_with(b"\x7fELF")) {
+            continue;
+        }
+        rd.drop_at(command);
+        rd.link(command, recovery)?;
+    }
+    Ok(())
+}
+
 /// Write `bytes`, the image `img` makes, to `out`.
 fn write(out: &Path, img: &BootImage, bytes: &[u8]) -> Result<()> {
     std::fs::write(out, bytes).with_context(|| format!("write {}", out.display()))?;
@@ -386,6 +394,30 @@ fn list(image: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_bases_native_property_editor_survives_packing() {
+        let mut rd = Ramdisk { entries: Vec::new() };
+        let native = b"\x7fELFbase property editor".to_vec();
+        rd.add("system/bin/resetprop", 0o755, native.clone()).unwrap();
+        install_commands(&mut rd, "skyward").unwrap();
+        let back = Ramdisk::decode(&rd.encode(Format::Gzip).unwrap()).unwrap();
+        let editor = back.find("system/bin/resetprop").unwrap();
+        assert_eq!(editor.data, native);
+        assert_eq!((editor.mode, editor.uid, editor.gid), (0o100755, 0, 0));
+        let unzip = back.find("system/bin/unzip").unwrap();
+        assert_eq!((unzip.mode & 0o170000, unzip.data.as_slice()), (0o120000, b"skyward".as_slice()));
+    }
+
+    #[test]
+    fn a_base_without_resetprop_gets_the_recovery_command() {
+        let mut rd = Ramdisk { entries: Vec::new() };
+        install_commands(&mut rd, "recovery").unwrap();
+        for name in paths::COMMANDS {
+            let command = rd.find(name).unwrap();
+            assert_eq!((command.mode & 0o170000, command.data.as_slice()), (0o120000, b"recovery".as_slice()));
+        }
+    }
 
     const PORT: &str = "\
 on property:sys.usb.config=mtp,adb

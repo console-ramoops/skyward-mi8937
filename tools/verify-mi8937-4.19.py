@@ -69,7 +69,11 @@ def main():
     assert b"/idVendor 0x18D1\n" in mtp_rules and b"/idProduct 0x2D08\n" in mtp_rules, "MTP/ADB must retain the Mi-Thorium base composite IDs"
     assert entries["system/bin/skyward"][1].startswith(b"\x7fELF\x02"), "64-bit Skyward binary missing"
     for name in ("7za", "avbctl", "resetprop", "unzip", "zstd"):
-        metadata, body = entries[f"system/bin/{name}"]
+        path = f"system/bin/{name}"
+        if name == "resetprop" and original.get(path, ((), b""))[1].startswith(b"\x7fELF"):
+            assert entries[path] == original[path], "base property editor changed"
+            continue
+        metadata, body = entries[path]
         assert metadata[0] & 0o170000 == 0o120000 and body == b"skyward", f"incorrect command link: {name}"
     print(f"Verified: unchanged kernel/DTBs and base runtime; {len(entries)} ramdisk entries")
     print(f"Image: {len(port)} / {64 << 20} bytes; LZMA ramdisk: {len(packed)} / {20 << 20} bytes")
