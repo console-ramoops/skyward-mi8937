@@ -17,8 +17,8 @@ case "$codename" in
     *) sed -i "s/^codename = .*/codename = \"$codename\"/" /skyward/device.toml ;;
 esac
 case "$model" in
-    ''|*[!a-zA-Z0-9\ ._-]*) ;;
-    *) sed -i "s/^model = .*/model = \"$model\"/" /skyward/device.toml ;;
+    ''|*[!a-zA-Z0-9\ ._/\(\)+-]*) ;;
+    *) sed -i "s|^model = .*|model = \"$model\"|" /skyward/device.toml ;;
 esac
 
 # On a non-dynamic ROM the base only supplies TWRP flags for these two

@@ -44,6 +44,62 @@ pub fn set(config: &str, timeout: Duration) -> Result<()> {
 /// serving it and takes every function off; init then sets the port up
 /// once the programs behind the new configuration are ready.
 pub fn switch(config: &str, timeout: Duration) -> Result<()> {
-    set("none", timeout)?;
-    set(config, timeout)
+    switch_with(config, |next| set(next, timeout))
+}
+
+fn switch_with(config: &str, mut apply: impl FnMut(&str) -> Result<()>) -> Result<()> {
+    let changed = apply("none").and_then(|()| apply(config));
+    match changed {
+        Err(error) if config != "adb" => {
+            let restored = apply("none").and_then(|()| apply("adb"));
+            match restored {
+                Ok(()) => Err(error.context(format!("USB {config} failed; restored adb"))),
+                Err(restore) => Err(error.context(format!("USB {config} failed; restoring adb also failed: {restore:#}"))),
+            }
+        }
+        result => result,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn failed_mtp_binding_restores_adb_and_keeps_the_original_error() {
+        let mut requests = Vec::new();
+        let error = switch_with("mtp,adb", |next| {
+            requests.push(next.to_string());
+            anyhow::ensure!(next != "mtp,adb", "MTP readiness timed out");
+            Ok(())
+        })
+        .unwrap_err();
+        assert_eq!(requests, ["none", "mtp,adb", "none", "adb"]);
+        assert!(format!("{error:#}").contains("MTP readiness timed out"));
+        assert!(format!("{error:#}").contains("restored adb"));
+    }
+
+    #[test]
+    fn successful_binding_does_not_reset_the_port_again() {
+        let mut requests = Vec::new();
+        switch_with("mtp,adb", |next| {
+            requests.push(next.to_string());
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(requests, ["none", "mtp,adb"]);
+    }
+
+    #[test]
+    fn failure_unbinding_also_restores_adb() {
+        let mut requests = Vec::new();
+        let error = switch_with("mtp,adb", |next| {
+            requests.push(next.to_string());
+            anyhow::ensure!(requests.len() != 1, "unbinding timed out");
+            Ok(())
+        })
+        .unwrap_err();
+        assert_eq!(requests, ["none", "none", "adb"]);
+        assert!(format!("{error:#}").contains("unbinding timed out"));
+    }
 }

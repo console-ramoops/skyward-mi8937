@@ -174,7 +174,7 @@ fn main() -> Result<()> {
             if rd.find(paths::TASK_PROFILES).is_none() {
                 rd.add(paths::TASK_PROFILES, 0o644, TASK_PROFILES.to_vec())?;
             }
-            rd.add(paths::MTP_RC, 0o644, MTP_RC.to_vec())?;
+            rd.add(paths::MTP_RC, 0o644, mtp_rules(&cfg.device.codename))?;
             rd.add(paths::KEYMASTER_RC, 0o644, KEYMASTER_RC.to_vec())?;
             // An older recovery binds MTP from the kernel's own legacy
             // function on the very request this one makes for its own, and
@@ -301,6 +301,20 @@ const MTP_RC: &[u8] = include_bytes!("mtp.rc");
 /// registration to work at all.
 const KEYMASTER_RC: &[u8] = include_bytes!("keymaster.rc");
 
+fn mtp_rules(codename: &str) -> Vec<u8> {
+    if codename == "mi8937_4_19" {
+        // Keep the composite IDs used by the supplied Mi-Thorium base;
+        // the generic template's Xiaomi IDs belong to the Mi 6 port.
+        std::str::from_utf8(MTP_RC)
+            .expect("the embedded init rules are UTF-8")
+            .replace("0x2717", "0x18D1")
+            .replace("0xFF48", "0x2D08")
+            .into_bytes()
+    } else {
+        MTP_RC.to_vec()
+    }
+}
+
 /// A property file without the lines that set any of `names`.
 fn without(props: &[u8], names: &[&str]) -> Vec<u8> {
     let mut out = Vec::with_capacity(props.len());
@@ -318,12 +332,18 @@ fn without(props: &[u8], names: &[&str]) -> Vec<u8> {
 /// `mtp,adb` configuration, with the indented lines under it; the plain
 /// `mtp,adb` trigger that only starts adbd stays, since adbd has to be
 /// running for the port to offer both functions. `None` when the base binds
-/// no MTP of its own, which is what a newer one looks like.
+/// no MTP of its own, which is what a newer one looks like. Readiness belongs
+/// to Skyward's functionfs provider: a base resetting it on "none" would
+/// leave the next MTP/ADB binding waiting for descriptors already written.
 fn without_legacy_mtp(text: &str) -> Option<String> {
     let mut kept: Vec<&str> = Vec::new();
     let mut dropping = false;
     let mut gone = false;
     for line in text.lines() {
+        if line.split_whitespace().eq(["setprop", "sys.usb.ffs.mtp.ready", "0"]) {
+            gone = true;
+            continue;
+        }
         if let Some(header) = line.strip_prefix("on ") {
             dropping = header.contains("sys.usb.ffs.ready") && header.contains("config=mtp,adb");
             gone |= dropping;
@@ -393,6 +413,27 @@ on property:sys.usb.config=adb
     #[test]
     fn a_base_that_binds_no_mtp_of_its_own_is_left_as_it_is() {
         assert!(without_legacy_mtp("on boot\n    write /x 1\n").is_none());
+    }
+
+    #[test]
+    fn mi_thorium_keeps_its_base_composite_ids() {
+        let rules = String::from_utf8(mtp_rules("mi8937_4_19")).unwrap();
+        assert!(rules.contains("/idVendor 0x18D1\n"));
+        assert!(rules.contains("/idProduct 0x2D08\n"));
+        assert_eq!(mtp_rules("ishtar"), MTP_RC);
+    }
+
+    #[test]
+    fn switching_to_none_does_not_clear_the_providers_mtp_readiness() {
+        let base = format!(
+            "{PORT}\non property:sys.usb.config=none && property:sys.usb.configfs=1\n    setprop sys.usb.ffs.mtp.ready 0\n    rm /config/usb_gadget/g1/configs/b.1/f2\n    write /config/usb_gadget/g1/idVendor 0x18D1\n"
+        );
+        let patched = without_legacy_mtp(&base).unwrap();
+        assert!(!patched.contains("setprop sys.usb.ffs.mtp.ready 0"));
+        assert!(patched.contains("on property:sys.usb.config=none"));
+        assert!(patched.contains("rm /config/usb_gadget/g1/configs/b.1/f2"));
+        assert!(patched.contains("write /config/usb_gadget/g1/idVendor 0x18D1"));
+        assert!(patched.contains("on property:sys.usb.config=adb\n    start adbd"));
     }
 
     #[test]

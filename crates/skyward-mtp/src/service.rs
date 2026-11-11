@@ -75,6 +75,7 @@ impl Service {
     /// Set the MTP function up and serve it: init can bind it from now on,
     /// and the computer finds no storage until one is offered.
     pub fn start(device: Device, zone: TimeZone) -> Result<Service> {
+        skyward_sys::set_prop(READY, "0")?;
         let mut fds = [0; 2];
         if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) } != 0 {
             return Err(io::Error::last_os_error()).context("make the MTP thread's wake pipe");
@@ -183,7 +184,9 @@ fn serve(mut port: Port, mut r: Responder, mut mail: Mailbox) -> Result<()> {
         // transfer did not.
         if port.let_go() {
             kmsg("mtp: the function was let go of, and is taken again")?;
+            skyward_sys::set_prop(READY, "0")?;
             port = port.taken_again()?;
+            skyward_sys::set_prop(READY, "1")?;
         }
         if !port.enabled() && !port.wait_enabled()? {
             mail.collect();

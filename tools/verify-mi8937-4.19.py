@@ -62,6 +62,11 @@ def main():
     assert wrapper.startswith(b"#!/system/bin/sh"), "startup wrapper missing"
     assert b"exec /system/bin/skyward recovery\n" in wrapper, "wrapper must select the recovery command"
     assert b"export TMPDIR=/tmp\n" in wrapper, "wrapper must provide the recovery shell's temporary directory"
+    usb_rules = entries["init.recovery.usb.rc"][1]
+    assert b"setprop sys.usb.ffs.mtp.ready 0" not in usb_rules, "base USB rules must not clear the MTP provider's readiness"
+    mtp_rules = entries["system/etc/init/skyward-mtp.rc"][1]
+    assert b"on post-fs && property:sys.usb.configfs=1\n" in mtp_rules, "MTP functionfs must be mounted before recovery starts"
+    assert b"/idVendor 0x18D1\n" in mtp_rules and b"/idProduct 0x2D08\n" in mtp_rules, "MTP/ADB must retain the Mi-Thorium base composite IDs"
     assert entries["system/bin/skyward"][1].startswith(b"\x7fELF\x02"), "64-bit Skyward binary missing"
     for name in ("7za", "avbctl", "resetprop", "unzip", "zstd"):
         metadata, body = entries[f"system/bin/{name}"]
