@@ -58,7 +58,10 @@ def main():
         assert entries[name] == original[name], f"base file changed: {name}"
     assert not any(name == "twres" or name.startswith("twres/") for name in entries), "TWRP resources remain"
     assert b'mi8937_4_19' in entries["skyward/device.toml"][1], "unified configuration missing"
-    assert entries["system/bin/recovery"][1].startswith(b"#!/system/bin/sh"), "startup wrapper missing"
+    wrapper = entries["system/bin/recovery"][1]
+    assert wrapper.startswith(b"#!/system/bin/sh"), "startup wrapper missing"
+    assert b"exec /system/bin/skyward recovery\n" in wrapper, "wrapper must select the recovery command"
+    assert b"export TMPDIR=/tmp\n" in wrapper, "wrapper must provide the recovery shell's temporary directory"
     assert entries["system/bin/skyward"][1].startswith(b"\x7fELF\x02"), "64-bit Skyward binary missing"
     for name in ("7za", "avbctl", "resetprop", "unzip", "zstd"):
         metadata, body = entries[f"system/bin/{name}"]

@@ -4,6 +4,7 @@
 export PATH=/system/bin:/system/xbin:/sbin
 export LD_LIBRARY_PATH=/system/lib64:/system/lib:/vendor/lib64:/vendor/lib
 mkdir -p /tmp
+export TMPDIR=/tmp
 exec >> /tmp/recovery.log 2>&1
 echo "Starting Skyward unified mi8937_4_19"
 
@@ -23,11 +24,11 @@ esac
 # On a non-dynamic ROM the base only supplies TWRP flags for these two
 # partitions. Skyward reads Android's five-column fstab instead.
 if ! /system/bin/grep -q ',logical' /system/etc/recovery.fstab; then
-    cat >> /system/etc/recovery.fstab <<'FSTAB'
-/dev/block/bootdevice/by-name/system /system_root ext4 ro,discard wait,check,formattable
-/dev/block/bootdevice/by-name/system /system_root erofs ro wait
-/dev/block/bootdevice/by-name/cust /vendor ext4 ro,discard wait,check,formattable
-FSTAB
+    printf '%s\n' \
+        '/dev/block/bootdevice/by-name/system /system_root ext4 ro,discard wait,check,formattable' \
+        '/dev/block/bootdevice/by-name/system /system_root erofs ro wait' \
+        '/dev/block/bootdevice/by-name/cust /vendor ext4 ro,discard wait,check,formattable' \
+        >> /system/etc/recovery.fstab
 fi
 
-exec /system/bin/skyward
+exec /system/bin/skyward recovery
