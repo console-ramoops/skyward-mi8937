@@ -671,6 +671,9 @@ fn reflash(ctx: &Context, kept: &Kept, next: Result<Slot>) {
 }
 
 fn remount_metadata() -> Result<()> {
+    if skyward_vab::current_slot()?.is_none() {
+        return Ok(());
+    }
     let metadata = Path::new(METADATA);
     if !skyward_block::mount::is_mount_point(metadata)? {
         skyward_block::mount::mount_ro(&Path::new(skyward_block::BY_NAME).join("metadata"), metadata)?;

@@ -66,6 +66,15 @@ impl Store {
     }
 }
 
+/// Single-slot phones have no alternate boot set or dual-boot metadata.
+#[cfg(any(target_os = "android", test))]
+fn restore_boot_set(slot: Option<skyward_vab::Slot>, restore: impl FnOnce() -> anyhow::Result<bool>) -> anyhow::Result<bool> {
+    match slot {
+        None => Ok(false),
+        Some(_) => restore(),
+    }
+}
+
 #[cfg(target_os = "android")]
 pub use sys::*;
 
@@ -199,13 +208,15 @@ mod sys {
     /// is, as everything that writes or erases the installed system first
     /// does; says whether it had to.
     pub fn ensure_installed() -> Result<bool> {
-        resume()?;
-        let state = state()?;
-        let Some(slot) = state.occupied.as_deref().map(|s| Slot::from_suffix(s).with_context(|| format!("the other system is in slot {s:?}"))).transpose()? else {
-            return Ok(false);
-        };
-        switch_to(slot, Who::Installed)?;
-        Ok(true)
+        restore_boot_set(skyward_vab::current_slot()?, || {
+            resume()?;
+            let state = state()?;
+            let Some(slot) = state.occupied.as_deref().map(|s| Slot::from_suffix(s).with_context(|| format!("the other system is in slot {s:?}"))).transpose()? else {
+                return Ok(false);
+            };
+            switch_to(slot, Who::Installed)?;
+            Ok(true)
+        })
     }
 
     /// The SHA-256 of all of a partition.
@@ -376,6 +387,14 @@ mod sys {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn missing_dual_boot_metadata_does_not_block_a_single_slot_phone() {
+        let restore = || Err(anyhow::anyhow!("missing /dev/block/by-name/metadata"));
+        assert!(!restore_boot_set(None, restore).unwrap());
+        assert!(restore_boot_set(Some(skyward_vab::Slot::A), restore).is_err());
+        assert!(restore_boot_set(Some(skyward_vab::Slot::B), || Ok(true)).unwrap());
+    }
 
     #[test]
     fn the_room_for_a_root_keeps_a_supers_worth_for_updates() {
