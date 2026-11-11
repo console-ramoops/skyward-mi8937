@@ -7,7 +7,7 @@ Mi-Thorium TWRP 4.19 kernel and recovery base.
 
 **Version:** 0.2.0 · **Maintainer:** alpha269 · **Kernel:** 4.19.312-Mi8937v2
 
-[Download](https://github.com/console-ramoops/skyward/releases/tag/v0.2.0-mi8937-4.19) ·
+[Download](https://github.com/console-ramoops/skyward/releases/tag/v0.2.0-mi8937-4_19) ·
 [Port source](https://github.com/console-ramoops/skyward/tree/mi8937) ·
 [Build and device details](https://github.com/console-ramoops/skyward/blob/mi8937/docs/mi8937_4_19.md)
 
@@ -26,26 +26,26 @@ size are detected at boot.
 | Redmi Note 5A | `ugglite` |
 | Redmi Note 5A Prime | `ugg` |
 
-Earlier builds have boot feedback from Redmi 4X. The current image and the
-other models still need hardware testing.
+Installer and device-detection fixes have been confirmed on Redmi 4X.
+This public 4.19.312 image and the other models still need hardware testing.
 
 ## Download and install
 
 Download
-[Skyward-0.2.0-mi8937-4.19-20261111.img](https://github.com/console-ramoops/skyward/releases/download/v0.2.0-mi8937-4.19/Skyward-0.2.0-mi8937-4.19-20261111.img)
+[Skyward-0.2.0-mi8937-4_19-20261111.img](https://github.com/console-ramoops/skyward/releases/download/v0.2.0-mi8937-4_19/Skyward-0.2.0-mi8937-4_19-20261111.img)
 from the release. An unlocked bootloader is required.
 
 SHA-256:
 
 ```text
-95ef14eaca1415d676b8a9e2d177edf6f31b65331a72c5c0fc5eac61b1273f1c
+f74469ed48953b6775aab4d32b60d37efb0814344ef413a5e2de690a1ced7cb3
 ```
 
 Enter fastboot mode, connect the phone to a computer, and run:
 
 ```sh
-fastboot flash recovery Skyward-0.2.0-mi8937-4.19-20261111.img
-fastboot boot Skyward-0.2.0-mi8937-4.19-20261111.img
+fastboot flash recovery Skyward-0.2.0-mi8937-4_19-20261111.img
+fastboot boot Skyward-0.2.0-mi8937-4_19-20261111.img
 ```
 
 From an existing TWRP recovery, choose **Install Image**, select the IMG, select **Recovery**,
@@ -55,6 +55,7 @@ then **Reboot Recovery**.
 
 - File manager, terminal, backups, image flashing and script-based ROM ZIP installation.
 - ADB and MTP, with 16 KiB MTP download requests for the Qualcomm USB controller.
+- Single-slot ZIP installation without A/B metadata requirements, and native device-property detection.
 - Back, Home and Menu hardware-key support.
 - Automatic data opening on ordinary recovery boots; locked user files request their credential on the Data page.
 - English by default, with saved language choices preserved.
