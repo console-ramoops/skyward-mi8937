@@ -559,9 +559,13 @@ pub fn about(cx: &Ctx) -> Frame {
     let mut c = Canvas::new(m.w, fitted(t, bottom));
     let (out, summary_top, bottom) = about_cards(cx, &mut c);
     let canvas = fit(c, t, bottom);
+    let version = match &cx.state.maintainer {
+        Some(name) => format!("{VERSION} · {name}"),
+        None => VERSION.to_string(),
+    };
     let art = HeroArt {
         wordmark: widgets::wordmark(t, f, "Skyward", m.dp(233.7), m.dp(37.8)),
-        version: widgets::version_line(t, f, VERSION),
+        version: widgets::version_line(t, f, &version),
         author: widgets::author_line(t, f, AUTHOR),
         runs: canvas.runs(),
     };
@@ -659,13 +663,17 @@ pub fn specs(cx: &Ctx) -> Frame {
     if let Some(r) = &i.android {
         y = widgets::info_card(&mut c, t, f, y + gap, &[(l.pick(ANDROID_VERSION), fmt::android(l, r, i.security_patch.as_ref()))]);
     }
+    let recovery_version = match &cx.state.maintainer {
+        Some(name) => format!("Skyward {VERSION} · {name}"),
+        None => format!("Skyward {VERSION}"),
+    };
     y = widgets::info_card(
         &mut c,
         t,
         f,
         y + gap,
         &[
-            (l.pick(["Recovery 版本", "Recovery 版本", "Recovery version"]), format!("Skyward {VERSION}")),
+            (l.pick(["Recovery 版本", "Recovery 版本", "Recovery version"]), recovery_version),
             (l.pick(["内核版本", "核心版本", "Kernel version"]), i.kernel.clone()),
         ],
     );

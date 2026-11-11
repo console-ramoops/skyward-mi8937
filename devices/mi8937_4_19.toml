@@ -4,12 +4,23 @@
 codename = "mi8937_4_19"
 brand = "Xiaomi"
 model = "Mi-Thorium 4.19"
+maintainer = "alpha269"
 ab = false
+
+[recovery]
+language = "en"
+open_data = true
 
 [display]
 # The framebuffer supplies width and height. A zero density selects the
 # device property, or a 360 dp layout based on the actual panel dimensions.
 density = 0
+status_inset_dp = 16
+
+[haptics]
+timed = "/sys/class/leds/vibrator"
+drive = 60
+strength = { lightest = 0.5, strongest = 1.0 }
 
 [backup]
 efs = ["modemst1", "modemst2", "fsg", "fsc"]

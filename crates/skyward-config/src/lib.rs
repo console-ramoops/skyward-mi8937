@@ -53,6 +53,8 @@ pub mod ramdisk {
 pub struct DeviceConfig {
     pub device: Device,
     #[serde(default)]
+    pub recovery: Recovery,
+    #[serde(default)]
     pub display: Display,
     #[serde(default)]
     pub modules: Modules,
@@ -98,6 +100,16 @@ pub struct DeviceConfig {
     /// The stock build the recovery is made on.
     #[serde(default)]
     pub stock: Option<Stock>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct Recovery {
+    /// Default locale before the user chooses a language.
+    #[serde(default)]
+    pub language: Option<String>,
+    /// Open data without a credential on ordinary recovery boots.
+    #[serde(default)]
+    pub open_data: bool,
 }
 
 /// The stock build a recovery is made on: the phone maker's full update
@@ -340,6 +352,9 @@ pub struct Device {
     pub brand: String,
     #[serde(default)]
     pub model: String,
+    /// The device port's maintainer, shown beside the recovery version.
+    #[serde(default)]
+    pub maintainer: Option<String>,
     #[serde(default = "default_true")]
     pub ab: bool,
     /// SoC marketing name shown on the About page.
@@ -352,6 +367,9 @@ pub struct Device {
 
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct Display {
+    /// Horizontal status bar inset in dp, for panels without a cutout.
+    #[serde(default)]
+    pub status_inset_dp: Option<u32>,
     #[serde(default)]
     pub width: u32,
     #[serde(default)]
@@ -579,6 +597,12 @@ impl DeviceConfig {
 
     pub fn parse(text: &str) -> Result<Self> {
         let cfg: DeviceConfig = toml::from_str(text).context("parse device config")?;
+        if let Some(language) = &cfg.recovery.language {
+            ensure!(matches!(language.as_str(), "en" | "zh-Hans" | "zh-Hant"), "[recovery] language: unsupported locale {language}");
+        }
+        if let Some(inset) = cfg.display.status_inset_dp {
+            ensure!((4..=64).contains(&inset), "[display] status_inset_dp must be between 4 and 64 dp");
+        }
         for log in &cfg.wipe.logs {
             let path = Path::new(log);
             let plain = path.components().all(|c| matches!(c, std::path::Component::RootDir | std::path::Component::Normal(_)));
@@ -706,6 +730,11 @@ mod tests {
         let cfg = DeviceConfig::parse(include_str!("../../../devices/mi8937_4_19.toml")).unwrap();
         assert!(!cfg.device.ab);
         assert_eq!(cfg.device.codename, "mi8937_4_19");
+        assert_eq!(cfg.device.maintainer.as_deref(), Some("alpha269"));
+        assert_eq!(cfg.recovery.language.as_deref(), Some("en"));
+        assert!(cfg.recovery.open_data);
+        assert_eq!(cfg.display.status_inset_dp, Some(16));
+        assert_eq!(cfg.haptics.as_ref().unwrap().timed.as_deref(), Some("/sys/class/leds/vibrator"));
         assert_eq!((cfg.display.width, cfg.display.height, cfg.display.density), (0, 0, 0));
         assert!(cfg.fstab.iter().all(|e| e.mount_point != "/data" && e.mount_point != "/metadata"));
         assert!(cfg.backup.partitions.is_empty(), "the runtime table selects the layout");

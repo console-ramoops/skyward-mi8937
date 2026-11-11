@@ -53,6 +53,36 @@ fn wait_for_function() -> Result<()> {
 /// the bus while the other is read from the file or written to it.
 const CHUNK: usize = 1 << 20;
 
+// Qualcomm's ci13xxx controller accepts at most four 4 KiB pages on
+// bulk IN. Larger writes return EINVAL even though commands and small
+// datasets work. Keep chunks packet-aligned at every USB speed.
+const IN_CHUNK: usize = 16 << 10;
+
+/// Finish a write without dropping bytes after a short completion.
+fn complete_write(mut bytes: &mut [u8], mut send: impl FnMut(&mut [u8]) -> Result<usize, Halt>) -> Result<(), Halt> {
+    while !bytes.is_empty() {
+        let n = send(bytes)?;
+        if n == 0 {
+            return Err(io::Error::new(ErrorKind::WriteZero, "MTP endpoint wrote no bytes").into());
+        }
+        if n > bytes.len() {
+            return Err(io::Error::new(ErrorKind::InvalidData, "MTP endpoint wrote more bytes than requested").into());
+        }
+        bytes = &mut bytes[n..];
+    }
+    Ok(())
+}
+
+fn send_whole_with(bytes: &mut [u8], packet: usize, mut send: impl FnMut(&mut [u8]) -> Result<usize, Halt>) -> Result<(), Halt> {
+    for piece in bytes.chunks_mut(IN_CHUNK) {
+        complete_write(piece, &mut send)?;
+    }
+    if bytes.len().is_multiple_of(packet) {
+        send(&mut [])?;
+    }
+    Ok(())
+}
+
 /// What a command is read into; one is a single short packet.
 const COMMAND_MAX: usize = 512;
 
@@ -936,13 +966,7 @@ impl Port {
     /// Send `bytes` whole, ending with a packet of nothing where they fill
     /// their last packet, so the computer knows the data is complete.
     fn send_whole(&mut self, bytes: &mut [u8], stop: &mut dyn FnMut() -> bool) -> Result<(), Halt> {
-        for piece in bytes.chunks_mut(CHUNK) {
-            self.transfer(piece, true, stop)?;
-        }
-        if bytes.len().is_multiple_of(self.packet) {
-            self.transfer(&mut [], true, stop)?;
-        }
-        Ok(())
+        send_whole_with(bytes, self.packet, |piece| self.transfer(piece, true, stop))
     }
 
     /// A data phase with `payload`.
@@ -963,7 +987,7 @@ impl Port {
     /// shorter than it was a moment ago halts the transfer.
     #[allow(clippy::too_many_arguments)]
     pub fn send_file(&mut self, code: u16, transaction: u32, file: &File, offset: u64, length: u64, stop: &mut dyn FnMut() -> bool) -> Result<(), Halt> {
-        let mut bufs = [vec![0u8; CHUNK], vec![0u8; CHUNK]];
+        let mut bufs = [vec![0u8; IN_CHUNK], vec![0u8; IN_CHUNK]];
         let end = offset + length;
         let mut at = offset;
         // Fill a buffer from `start` with what comes next of the file: how
@@ -1004,7 +1028,11 @@ impl Port {
             } else {
                 0
             };
-            self.wait(key, stop)?;
+            let mut first = Some(self.wait(key, stop)?);
+            complete_write(&mut this[..len], |rest| match first.take() {
+                Some(n) => Ok(n),
+                None => self.transfer(rest, true, stop),
+            })?;
             if next == 0 {
                 break;
             }
@@ -1137,5 +1165,55 @@ impl Port {
         self.stop_reading()?;
         self.cancelled = false;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn downloads_fit_ci13xxx_requests_and_end_with_the_right_packet() {
+        for packet in [64, 512, 1024] {
+            for length in [0, packet - HEADER, IN_CHUNK - HEADER, IN_CHUNK, (1 << 20) + 17] {
+                let mut bytes = dataset::data_header(crate::codes::op::GET_OBJECT, 7, length as u64).to_vec();
+                bytes.extend((0..length).map(|n| n as u8));
+                let expected = bytes.clone();
+                let mut received = Vec::new();
+                let mut sizes = Vec::new();
+                send_whole_with(&mut bytes, packet, |piece| {
+                    if piece.len() > 16 << 10 {
+                        return Err(io::Error::from_raw_os_error(libc::EINVAL).into());
+                    }
+                    sizes.push(piece.len());
+                    received.extend_from_slice(piece);
+                    Ok(piece.len())
+                })
+                .unwrap();
+                assert_eq!(received, expected);
+                assert_eq!(sizes.last() == Some(&0), expected.len().is_multiple_of(packet));
+                assert!(sizes[..sizes.len() - 1].iter().all(|n| n.is_multiple_of(packet)));
+            }
+        }
+    }
+
+    #[test]
+    fn short_completions_keep_every_byte() {
+        let mut bytes = (0..40000).map(|n| n as u8).collect::<Vec<_>>();
+        let expected = bytes.clone();
+        let mut received = Vec::new();
+        send_whole_with(&mut bytes, 512, |piece| {
+            let n = piece.len().min(512);
+            received.extend_from_slice(&piece[..n]);
+            Ok(n)
+        })
+        .unwrap();
+        assert_eq!(received, expected);
+    }
+
+    #[test]
+    fn a_write_that_stops_making_progress_fails() {
+        let mut bytes = [0u8; 64];
+        assert!(matches!(complete_write(&mut bytes, |_| Ok(0)), Err(Halt::Failed(e)) if e.kind() == ErrorKind::WriteZero));
     }
 }

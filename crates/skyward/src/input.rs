@@ -35,7 +35,16 @@ fn set_nonblocking(fd: RawFd) -> io::Result<()> {
     Ok(())
 }
 
-const KEYS: [KeyCode; 4] = [KeyCode::KEY_POWER, KeyCode::KEY_VOLUMEUP, KeyCode::KEY_VOLUMEDOWN, KeyCode::KEY_BACK];
+const KEYS: [KeyCode; 8] = [
+    KeyCode::KEY_POWER,
+    KeyCode::KEY_VOLUMEUP,
+    KeyCode::KEY_VOLUMEDOWN,
+    KeyCode::KEY_BACK,
+    KeyCode::KEY_HOME,
+    KeyCode::KEY_HOMEPAGE,
+    KeyCode::KEY_MENU,
+    KeyCode::KEY_APPSELECT,
+];
 
 fn key_of(code: KeyCode) -> Option<Key> {
     match code {
@@ -43,6 +52,15 @@ fn key_of(code: KeyCode) -> Option<Key> {
         KeyCode::KEY_VOLUMEUP => Some(Key::VolumeUp),
         KeyCode::KEY_VOLUMEDOWN => Some(Key::VolumeDown),
         KeyCode::KEY_BACK => Some(Key::Back),
+        KeyCode::KEY_HOME | KeyCode::KEY_HOMEPAGE => Some(Key::Home),
+        KeyCode::KEY_MENU | KeyCode::KEY_APPSELECT => Some(Key::Menu),
+        _ => None,
+    }
+}
+
+fn button_event(event: &InputEvent) -> Option<Event> {
+    match event.destructure() {
+        EventSummary::Key(_, code, value @ (0 | 1)) => key_of(code).map(|key| Event::Key(key, value == 1)),
         _ => None,
     }
 }
@@ -225,6 +243,11 @@ impl Panel {
                     self.raw.1 = v;
                     self.moved = true;
                 }
+                EventSummary::Key(_, _, _) => {
+                    if let Some(key) = button_event(&e) {
+                        out.push(key);
+                    }
+                }
                 _ => {}
             }
         }
@@ -278,7 +301,7 @@ impl Inputs {
 
     /// Take in the devices under /dev/input not seen before: the first
     /// direct multitouch device as the panel, and every device with a
-    /// power, volume or back key as buttons. A panel taken in is told what
+    /// power, volume or navigation key as buttons. A panel taken in is told what
     /// the device description writes to the touchscreen.
     fn scan(&mut self) -> Result<()> {
         for (path, dev) in evdev::raw_stream::enumerate() {
@@ -384,10 +407,8 @@ impl Inputs {
                     // The kernel's own repeats of a key held are left out;
                     // the UI times its own.
                     for e in events {
-                        if let EventSummary::Key(_, code, value @ (0 | 1)) = e.destructure() {
-                            if let Some(k) = key_of(code) {
-                                out.push(Event::Key(k, value == 1));
-                            }
+                        if let Some(key) = button_event(&e) {
+                            out.push(key);
                         }
                     }
                 }
@@ -404,5 +425,28 @@ impl Inputs {
             self.seen.remove(&path);
         }
         Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn touchscreen_navigation_keys_report_presses_and_releases() {
+        for (code, key) in [
+            (KeyCode::KEY_BACK, Key::Back),
+            (KeyCode::KEY_HOME, Key::Home),
+            (KeyCode::KEY_HOMEPAGE, Key::Home),
+            (KeyCode::KEY_MENU, Key::Menu),
+            (KeyCode::KEY_APPSELECT, Key::Menu),
+        ] {
+            for value in [0, 1] {
+                let event = InputEvent::new(evdev::EventType::KEY.0, code.0, value);
+                assert!(matches!(button_event(&event), Some(Event::Key(found, down)) if found == key && down == (value == 1)));
+            }
+            assert!(button_event(&InputEvent::new(evdev::EventType::KEY.0, code.0, 2)).is_none());
+        }
+        assert!(button_event(&InputEvent::new(evdev::EventType::KEY.0, KeyCode::BTN_TOUCH.0, 1)).is_none());
     }
 }

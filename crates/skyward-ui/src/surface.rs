@@ -1271,8 +1271,16 @@ pub mod fb {
             for try_no in 1..=3 {
                 let down = ioctl_int(fd, BLANK, BLANK_POWERDOWN);
                 let up = ioctl_int(fd, BLANK, BLANK_UNBLANK);
-                std::thread::sleep(std::time::Duration::from_millis(400));
-                let now = self.lit_at.as_ref().and_then(|at| std::fs::read_to_string(at).ok()).unwrap_or_default();
+                // Stop waiting once the driver reports a lit panel. A
+                // driver without that indicator keeps the original delay.
+                let mut now = String::new();
+                for _ in 0..8 {
+                    now = self.lit_at.as_ref().and_then(|at| std::fs::read_to_string(at).ok()).unwrap_or_default();
+                    if now.trim().ends_with('1') {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
                 eprintln!("take over the panel {why} ({try_no}): down {down:?} up {up:?}, lit reads {:?}", now.trim());
                 if now.trim().ends_with('1') {
                     break;
@@ -1353,6 +1361,19 @@ pub mod fb {
             }
             if self.power == Power::Off {
                 self.wake();
+            } else if !self.told && self.flip {
+                // Keep the initial mode change that allocates the driver's
+                // framebuffer: select the back page before takeover resets
+                // the offset. A write identical to the current mode may be
+                // ignored by mdssfb.
+                let mut v = self.var;
+                v.yres_virtual = self.h * 2;
+                v.yoffset = self.back * self.h;
+                v.bits_per_pixel = 32;
+                ioctl(self.file.as_raw_fd(), PUT_VSCREENINFO, &mut v).context("prepare the framebuffer")?;
+                // Takeover can replace and clear the mapping. Finish it
+                // before copying the first frame, so that frame survives.
+                self.take_over("before the first frame");
             }
             // **Lit again, whichever it was.** A panel that only rested is
             // lit by the frame shown to it, and one that was turned off is
@@ -1405,9 +1426,6 @@ pub mod fb {
             if !self.told {
                 eprintln!("flipping with FBIOPUT_VSCREENINFO at the blank, page {} shown", self.back);
                 self.told = true;
-                // A frame is in memory and pointed at now, so this is where the
-                // boot loader's picture is replaced.
-                self.take_over("after the first frame");
             }
             self.frames += 1;
             // The driver only recomputes its rate once a target number of

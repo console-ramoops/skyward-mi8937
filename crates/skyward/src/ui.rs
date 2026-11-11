@@ -1252,6 +1252,8 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
     };
     let mut app = App::new(first, w, h, density as f32 / 160.0);
     app.set_screen_corners(cfg.display.corner_radius as f32);
+    app.set_status_inset(cfg.display.status_inset_dp);
+    app.state.maintainer = cfg.device.maintainer.clone();
     // The settings kept from the starts before are back before the first
     // frame, and before file transfer starts with its switch and the time
     // zone. The pages speak the language chosen then, or else the one the
@@ -1264,7 +1266,8 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
     // back over it: a name the phone does not have is not ticked, and one it
     // has is left as the last start chose it.
     app.set_backup_of(backup::choices(&cfg.backup.efs, &cfg.backup.partitions)?.into_iter().map(|choice| (choice.name, choice.hint)).collect());
-    app.take_settings(kept.settings(), named);
+    let default_language = cfg.recovery.language.as_deref().map(Lang::for_locale).transpose()?;
+    app.take_settings(kept.settings(), default_language.or(named));
     let mut keeper = Keeper::new(&kept);
     skyward_sys::kmsg(&format!(
         "the pages speak {:?}, {}, and the locale named is {}",
@@ -1519,6 +1522,13 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
             }
         }
         Work::Menu | Work::Exit | Work::Fastboot | Work::PromptWipeData | Work::Unsupported(_) => {}
+    }
+    // Ordinary boots open data on the existing worker, so the first page
+    // stays responsive. Explicit installs, wipes and fastboot keep their
+    // own ordering and ownership of data and metadata.
+    if cfg.recovery.open_data && matches!(request.work, Work::Menu | Work::Exit) && !app.open_data().is_empty() {
+        skyward_sys::kmsg("opening data in the background at recovery startup")?;
+        decryptor = Some(Decryptor::start(decrypt::Job::Open)?);
     }
     // A switch asked for finishes one cut off before itself; fastboot leaves
     // /metadata to fastbootd until the recovery's pages come up.
@@ -2407,6 +2417,10 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
                     }
                     Effect::FactoryReset => {
                         ensure!(eraser.is_none(), "erasing is under way already");
+                        if decryptor.is_some() {
+                            app.report(app.state.lang.pick(DATA_OPENING), now);
+                            continue;
+                        }
                         if !withhold(&mut transfer, &mut app, now)? {
                             continue;
                         }

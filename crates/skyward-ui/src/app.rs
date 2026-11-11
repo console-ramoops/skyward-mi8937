@@ -1229,7 +1229,7 @@ pub const SCREEN_OFF: [Option<u64>; 7] = [Some(15_000), Some(30_000), Some(60_00
 /// The time zones the clock and the times on the pages can keep, in the
 /// order their page lists them: the name, the cities it covers, and the
 /// zone's name in the tz database.
-pub const TIME_ZONES: [(Text, Text, &str); 9] = [
+pub const TIME_ZONES: [(Text, Text, &str); 11] = [
     (["中国标准时间", "中國標準時間", "China Standard Time"], ["北京、上海", "北京、上海", "Beijing, Shanghai"], "Asia/Shanghai"),
     (["香港时间", "香港時間", "Hong Kong Time"], ["香港", "香港", "Hong Kong"], "Asia/Hong_Kong"),
     (["台北时间", "台北時間", "Taipei Time"], ["台北", "台北", "Taipei"], "Asia/Taipei"),
@@ -1239,6 +1239,8 @@ pub const TIME_ZONES: [(Text, Text, &str); 9] = [
     (["中欧时间", "中歐時間", "Central European Time"], ["柏林、巴黎", "柏林、巴黎", "Berlin, Paris"], "Europe/Berlin"),
     (["美国东部时间", "美國東部時間", "Eastern Time"], ["纽约", "紐約", "New York"], "America/New_York"),
     (["美国太平洋时间", "美國太平洋時間", "Pacific Time"], ["洛杉矶", "洛杉磯", "Los Angeles"], "America/Los_Angeles"),
+    (["印度标准时间", "印度標準時間", "Indian Standard Time (IST)"], ["新德里、孟买", "新德里、孟買", "New Delhi, Mumbai · UTC+5:30"], "Asia/Kolkata"),
+    (["印度尼西亚西部时间", "印度尼西亞西部時間", "Western Indonesia Time (WIB)"], ["雅加达", "雅加達", "Jakarta · UTC+7"], "Asia/Jakarta"),
 ];
 
 /// What a control does when touched.
@@ -1661,6 +1663,7 @@ impl Frame {
 /// stands.
 #[derive(Clone, Debug, PartialEq)]
 pub struct State {
+    pub maintainer: Option<String>,
     /// The language the pages speak.
     pub lang: Lang,
     /// The language was chosen on the language page, now or at an earlier
@@ -1857,6 +1860,7 @@ pub struct State {
 impl Default for State {
     fn default() -> Self {
         State {
+            maintainer: None,
             lang: Lang::Hans,
             language_chosen: false,
             dark: false,
@@ -2042,6 +2046,8 @@ pub enum Key {
     VolumeUp,
     VolumeDown,
     Back,
+    Home,
+    Menu,
 }
 
 /// Where a screenshot went.
@@ -2778,6 +2784,7 @@ fn keyboard_strip(t: &Theme, frame: &Frame) -> (Canvas, i32) {
 
 pub struct App {
     pub state: State,
+    status_inset_dp: Option<u32>,
     /// The pages open, the one shown last: each with how far it is
     /// scrolled and where the keys are on it.
     stack: Vec<(Screen, f32, Focus)>,
@@ -2983,6 +2990,7 @@ impl App {
             w,
             h,
             px_per_dp,
+            status_inset_dp: None,
         }
     }
 
@@ -2993,11 +3001,22 @@ impl App {
     }
 
     pub fn theme(&self) -> Theme {
-        if self.state.dark {
+        let mut theme = if self.state.dark {
             Theme::dark(self.w, self.h, self.px_per_dp)
         } else {
             Theme::light(self.w, self.h, self.px_per_dp)
+        };
+        if let Some(inset) = self.status_inset_dp {
+            theme.m.status_x = theme.m.dp(inset as f32);
+            theme.m.status_right = theme.m.dp(inset as f32);
+            theme.m.status_bolt_right = theme.m.dp(inset.saturating_sub(4) as f32);
         }
+        theme
+    }
+
+    pub fn set_status_inset(&mut self, inset: Option<u32>) {
+        self.status_inset_dp = inset;
+        self.refresh();
     }
 
     pub fn screen(&self) -> Screen {
@@ -4991,6 +5010,28 @@ impl App {
     /// In the file manager, back climbs a folder until it reaches the root,
     /// and in a place, until it reaches the place's top.
     fn back(&mut self, now: u64) -> Vec<Effect> {
+        self.back_page(now, false)
+    }
+
+    /// Home leaves pages through the same work and unsaved-file guards as
+    /// Back, while skipping the file manager's directory traversal.
+    fn home(&mut self, now: u64) -> Vec<Effect> {
+        let mut fx = Vec::new();
+        while self.stack.len() > 1 && self.screen() != Screen::Home {
+            let depth = self.stack.len();
+            fx.extend(self.back_page(now, true));
+            if self.stack.len() == depth {
+                return fx;
+            }
+            self.end_turn();
+        }
+        if self.screen() == Screen::Decrypt {
+            fx.extend(self.act(Action::Skip, now));
+        }
+        fx
+    }
+
+    fn back_page(&mut self, now: u64, home: bool) -> Vec<Effect> {
         let (l, mut fx) = (self.state.lang, Vec::new());
         if self.stack.len() <= 1 {
             return fx;
@@ -5015,14 +5056,14 @@ impl App {
                 self.state.asking_delete = false;
             }
             Screen::Files => {
-                if let Some(up) = self.state.files.up() {
+                if let Some(up) = self.state.files.up().filter(|_| !home) {
                     return vec![Effect::ReadDir(up)];
                 }
                 // Leaving the file manager puts a picked entry down.
                 self.state.clip = None;
             }
             Screen::Choose(place) => {
-                if let Some(up) = self.state.folder(Screen::Choose(place)).up() {
+                if let Some(up) = self.state.folder(Screen::Choose(place)).up().filter(|_| !home) {
                     return vec![Effect::ReadPlace(place, up)];
                 }
             }
@@ -5331,7 +5372,10 @@ impl App {
     }
 
     /// Open the data partition, the decrypt page saying so meanwhile.
-    fn open_data(&mut self) -> Vec<Effect> {
+    pub fn open_data(&mut self) -> Vec<Effect> {
+        if !matches!(self.state.data, Data::Closed | Data::Failed(_)) {
+            return Vec::new();
+        }
         self.state.data = Data::Opening;
         self.refresh();
         vec![Effect::OpenData]
@@ -6598,6 +6642,18 @@ impl App {
             Key::Back => {
                 self.button = Some((key, Press::Spent));
                 self.act(Action::Back, at)
+            }
+            Key::Home => {
+                self.button = Some((key, Press::Spent));
+                self.home(at)
+            }
+            Key::Menu => {
+                self.button = Some((key, Press::Spent));
+                if self.screen() == Screen::Settings || self.screen() == Screen::Fastboot {
+                    Vec::new()
+                } else {
+                    self.act(Action::Open(Screen::Settings), at)
+                }
             }
             Key::VolumeUp | Key::VolumeDown => {
                 let down = key == Key::VolumeDown;
@@ -8913,6 +8969,41 @@ mod tests {
         let mut fx = app.key(key, now);
         fx.extend(app.key_up(key, now));
         fx
+    }
+
+    #[test]
+    fn bottom_keys_open_settings_go_back_and_return_home() {
+        let mut app = App::new(Screen::Home, 720, 1280, 2.0);
+        app.open(Screen::About);
+        press(&mut app, Key::Menu, 1000);
+        assert_eq!(app.screen(), Screen::Settings);
+        press(&mut app, Key::Back, 1100);
+        assert_eq!(app.screen(), Screen::About);
+        press(&mut app, Key::Home, 1200);
+        assert_eq!(app.screen(), Screen::Home);
+        assert_eq!(app.stack.len(), 1);
+    }
+
+    #[test]
+    fn home_keeps_the_install_page_while_writing() {
+        let mut app = App::new(Screen::Home, 720, 1280, 2.0);
+        app.open(Screen::Installing);
+        app.state.install = Install::Flashing { partition: "boot", stage: None };
+        assert!(press(&mut app, Key::Home, 1000).is_empty());
+        assert_eq!(app.screen(), Screen::Installing);
+        assert!(matches!(app.state.install, Install::Flashing { .. }));
+    }
+
+    #[test]
+    fn startup_opening_and_the_decrypt_page_share_one_job() {
+        let mut app = App::new(Screen::Home, 720, 1280, 2.0);
+        assert_eq!(app.open_data(), vec![Effect::OpenData]);
+        assert_eq!(app.screen(), Screen::Home);
+        app.open(Screen::Decrypt);
+        assert!(app.arrive().is_empty());
+        assert!(app.open_data().is_empty());
+        app.data_waiting(None);
+        assert!(app.open_data().is_empty());
     }
 
     /// The control the keys are on, on the page drawn.

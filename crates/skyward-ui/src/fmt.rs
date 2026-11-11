@@ -1758,6 +1758,15 @@ mod tests {
     }
 
     #[test]
+    fn ist_and_wib_keep_their_offsets_across_midnight() {
+        // 2026-10-18 18:31 UTC.
+        let at = 1_792_348_260;
+        assert_eq!(clock(at, zone("Asia/Kolkata")), "00:01");
+        assert_eq!(date(Lang::En, at, zone("Asia/Kolkata")), "October 19, 2026");
+        assert_eq!(clock(at, zone("Asia/Jakarta")), "01:31");
+    }
+
+    #[test]
     fn zones_keep_their_own_summer_time() {
         // 2026-07-01 12:00 UTC, and 2026-01-15 12:00 UTC.
         let (summer, winter) = (1_782_907_200, 1_768_478_400);
