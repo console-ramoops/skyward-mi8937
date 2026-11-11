@@ -72,7 +72,11 @@ pub fn with_program(image: &[u8], own_ramdisk: Option<u64>, program: &[u8], star
         Some(bytes) => (bytes, MAP),
         None => (0, INIT),
     };
-    ensure!(kept <= image.ramdisk.len() as u64, "the other system's own ramdisk of {kept} bytes is longer than the {} its init_boot image holds", image.ramdisk.len());
+    ensure!(
+        kept <= image.ramdisk.len() as u64,
+        "the other system's own ramdisk of {kept} bytes is longer than the {} its init_boot image holds",
+        image.ramdisk.len()
+    );
     image.ramdisk.truncate(kept as usize);
     image.ramdisk.extend_from_slice(&archive(at, program, start)?);
     image.to_bytes()
@@ -94,7 +98,7 @@ pub(crate) mod tests {
             cmdline: Box::new([0; 1536]),
             v4_signature_size: Some(0),
         };
-        let mut image = BootImage { header, kernel: Vec::new(), ramdisk: ramdisk.to_vec() }.to_bytes().unwrap();
+        let mut image = BootImage { header: abootimg_oxide::Header::V3(header), kernel: Vec::new(), ramdisk: ramdisk.to_vec() }.to_bytes().unwrap();
         image.resize(1 << 20, 0);
         image
     }

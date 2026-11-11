@@ -29,7 +29,11 @@ pub enum Package {
     Script,
     /// A system to install beside the installed one.
     System(skyward_systems::package::Contents),
-    Unknown,
+    /// Nothing this recovery installs, and what was looked at to tell: the
+    /// bytes a file starts with, or the shape of a zip that holds neither an
+    /// update nor a script. What the recovery says when it refuses is the
+    /// evidence the next round works from.
+    Unknown(String),
 }
 
 /// An A/B update package: the payload update_engine applies, where it
@@ -63,12 +67,7 @@ pub struct Metadata(BTreeMap<String, String>);
 
 impl Metadata {
     pub fn parse(text: &str) -> Metadata {
-        Metadata(
-            text.lines()
-                .filter_map(|line| line.split_once('='))
-                .map(|(k, v)| (k.trim().to_string(), v.trim().to_string()))
-                .collect(),
-        )
+        Metadata(text.lines().filter_map(|line| line.split_once('=')).map(|(k, v)| (k.trim().to_string(), v.trim().to_string())).collect())
     }
 
     /// A value, unless it is missing or empty.
@@ -83,7 +82,12 @@ pub fn identify<R: Read + Seek>(mut file: R) -> Result<Package> {
     let mut head = Vec::with_capacity(HEAD);
     (&mut file).take(HEAD as u64).read_to_end(&mut head).context("read the package's first bytes")?;
     if !head.starts_with(b"PK\x03\x04") {
-        return Ok(image::detect(&mut file, &head)?.map_or(Package::Unknown, Package::Image));
+        // What a file starts with is the evidence the next round works
+        // from: a filesystem no probe knows, a sparse image with its own
+        // header over the filesystem inside it, and nothing at all each
+        // read differently here.
+        let seen = head[..head.len().min(16)].iter().map(|b| format!("{b:02x}")).collect::<Vec<String>>().join(" ");
+        return Ok(image::detect(&mut file, &head)?.map_or(Package::Unknown(format!("its first bytes are {seen}")), Package::Image));
     }
     file.seek(SeekFrom::Start(0)).context("rewind the package")?;
     let mut zip = ZipArchive::new(file).context("read the zip directory")?;
@@ -96,7 +100,7 @@ pub fn identify<R: Read + Seek>(mut file: R) -> Result<Package> {
     if zip.index_for_name(UPDATE_BINARY).is_some() {
         return Ok(Package::Script);
     }
-    Ok(Package::Unknown)
+    Ok(Package::Unknown("a zip with neither an update nor an install script".into()))
 }
 
 fn update<R: Read + Seek>(zip: &mut ZipArchive<R>) -> Result<Update> {
@@ -158,7 +162,9 @@ pub fn check(update: &Update, phone: &Phone) -> Result<(), Refusal> {
     if m.get("pre-build").is_some() || m.get("pre-build-incremental").is_some() {
         return Err(Refusal::Incremental);
     }
-    let Some(build) = &phone.installed else { return Ok(()) };
+    let Some(build) = &phone.installed else {
+        return Ok(());
+    };
     // A full package may install the version already there again; going
     // back needs a package made for the build it leaves, an incremental
     // one.
@@ -208,11 +214,7 @@ METADATA_SIZE=1024
 ";
 
     fn phone() -> Phone {
-        Phone {
-            device: "ishtar".into(),
-            serial: "2674dc3e".into(),
-            installed: Some(Build { timestamp: 1_778_243_655, security_patch: "2026-04-01".into() }),
-        }
+        Phone { device: "ishtar".into(), serial: "2674dc3e".into(), installed: Some(Build { timestamp: 1_778_243_655, security_patch: "2026-04-01".into() }) }
     }
 
     fn update_with(metadata: &str, properties: &str) -> Update {
@@ -255,15 +257,11 @@ METADATA_SIZE=1024
 
     #[test]
     fn incremental_and_older_packages_are_refused() {
-        let incremental = format!(
-            "{METADATA_TEXT}pre-build=Xiaomi/ishtar/ishtar:16/X/OS3.0.305.0.WMACNXM:user/release-keys\npre-build-incremental=OS3.0.305.0.WMACNXM\n"
-        );
+        let incremental =
+            format!("{METADATA_TEXT}pre-build=Xiaomi/ishtar/ishtar:16/X/OS3.0.305.0.WMACNXM:user/release-keys\npre-build-incremental=OS3.0.305.0.WMACNXM\n");
         assert_eq!(check(&update_with(&incremental, PROPERTIES_TEXT), &phone()), Err(Refusal::Incremental));
         let older = METADATA_TEXT.replace("1781000000", "1770000000");
-        assert_eq!(
-            check(&update_with(&older, PROPERTIES_TEXT), &phone()),
-            Err(Refusal::Older { package: 1_770_000_000, installed: 1_778_243_655 })
-        );
+        assert_eq!(check(&update_with(&older, PROPERTIES_TEXT), &phone()), Err(Refusal::Older { package: 1_770_000_000, installed: 1_778_243_655 }));
         let patch = METADATA_TEXT.replace("2026-06-01", "2026-03-01");
         assert_eq!(
             check(&update_with(&patch, PROPERTIES_TEXT), &phone()),
@@ -321,7 +319,9 @@ METADATA_SIZE=1024
         ]);
         assert!(identify(Cursor::new(squeezed)).is_err());
         let other = zip_with(&[("readme.txt", b"hello", CompressionMethod::Stored)]);
-        assert_eq!(identify(Cursor::new(other)).unwrap(), Package::Unknown);
-        assert_eq!(identify(Cursor::new(b"just some text".to_vec())).unwrap(), Package::Unknown);
+        assert!(matches!(identify(Cursor::new(other)).unwrap(), Package::Unknown(_)));
+        let text = identify(Cursor::new(b"just some text".to_vec())).unwrap();
+        // The bytes it names are the file's own start: "just".
+        assert!(matches!(&text, Package::Unknown(why) if why.contains("6a 75 73 74")), "{text:?}");
     }
 }

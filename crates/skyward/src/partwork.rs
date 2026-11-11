@@ -294,7 +294,7 @@ fn repair(part: Part, tell: &mut dyn FnMut(Event)) -> Result<(), Stop> {
     tell(Event::Listed(vec![name(&part)]));
     tell(Event::At(0));
     let done = reach(&part, |device| {
-        let filesystem = probe::filesystem(device)?.context("the partition holds no filesystem blkid knows")?;
+        let filesystem = probe::filesystem(device)?.context("the partition holds no filesystem this recovery knows")?;
         let (fixed, ran) = fsck::repair(device, &filesystem)?;
         Ok((Item::Fixed(fixed), ran.said))
     });
@@ -340,7 +340,7 @@ fn reach<T>(part: &Part, work: impl FnOnce(&Path) -> Result<T>) -> Result<T> {
             done
         }
         Part::Entry(entry) => {
-            let at = Path::new(&entry.mount_point);
+            let at = Path::new(fstab::point(&entry.mount_point));
             let mounted = mount::is_mount_point(at)?;
             if mounted {
                 mount::umount(at)?;
@@ -376,20 +376,12 @@ mod tests {
         erase::make(Path::new(&device), "f2fs", &[], false).unwrap();
         mount::mount_ro(Path::new(&device), &at).unwrap();
         let mount_point = at.to_string_lossy().into_owned();
-        let entry = Entry {
-            device: device.clone(),
-            mount_point: mount_point.clone(),
-            filesystem: "f2fs".into(),
-            options: Vec::new(),
-            extras: Vec::new(),
-        };
+        let entry = Entry { device: device.clone(), mount_point: mount_point.clone(), filesystem: "f2fs".into(), options: Vec::new(), extras: Vec::new() };
 
         let mut told = Vec::new();
         assert_eq!(repair(Part::Entry(entry), &mut |event| told.push(event)), Ok(()));
 
-        let [Event::Listed(names), Event::At(0), Event::Ended(0, item, said)] = &told[..] else {
-            panic!("told {} events", told.len())
-        };
+        let [Event::Listed(names), Event::At(0), Event::Ended(0, item, said)] = &told[..] else { panic!("told {} events", told.len()) };
         assert_eq!(names, &[mount_point.trim_start_matches('/').to_string()]);
         assert_eq!(item, &Item::Fixed(Fixed::Clean), "{said}");
         assert!(mount::is_mount_point(&at).unwrap(), "mounted again");

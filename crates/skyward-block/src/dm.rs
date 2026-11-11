@@ -10,19 +10,37 @@ use zerocopy::{FromBytes, FromZeros, Immutable, IntoBytes, KnownLayout};
 pub enum Target {
     /// `sectors` sectors of block device `device` (major, minor), starting
     /// at its sector `offset`.
-    Linear { sectors: u64, device: (u32, u32), offset: u64 },
-    Zero { sectors: u64 },
+    Linear {
+        sectors: u64,
+        device: (u32, u32),
+        offset: u64,
+    },
+    Zero {
+        sectors: u64,
+    },
     /// `sectors` sectors of `device`, decrypted with `key` under `cipher`
     /// as the kernel names it. `wrapped` says the key is one only the
     /// storage hardware can unwrap, which is how a phone keeps the key its
     /// data partition is encrypted with out of the running system.
-    DefaultKey { sectors: u64, device: String, cipher: String, key: String, wrapped: bool },
+    DefaultKey {
+        sectors: u64,
+        device: String,
+        cipher: String,
+        key: String,
+        wrapped: bool,
+    },
     /// `sectors` sectors of block device `base` as changed by what block
     /// device `cow` keeps, both (major, minor), in chunks of
     /// [`SNAPSHOT_CHUNK`] sectors that last across restarts. Merging, the
     /// kernel writes the changes into `base` as it goes. `overflow` has the
     /// kernel say when `cow` runs out, where its target can.
-    Snapshot { sectors: u64, base: (u32, u32), cow: (u32, u32), merge: bool, overflow: bool },
+    Snapshot {
+        sectors: u64,
+        base: (u32, u32),
+        cow: (u32, u32),
+        merge: bool,
+        overflow: bool,
+    },
 }
 
 /// The chunk an update's snapshots keep their changes in, in sectors.
@@ -31,10 +49,7 @@ pub const SNAPSHOT_CHUNK: u32 = 8;
 impl Target {
     pub fn sectors(&self) -> u64 {
         match self {
-            Target::Linear { sectors, .. }
-            | Target::Zero { sectors }
-            | Target::DefaultKey { sectors, .. }
-            | Target::Snapshot { sectors, .. } => *sectors,
+            Target::Linear { sectors, .. } | Target::Zero { sectors } | Target::DefaultKey { sectors, .. } | Target::Snapshot { sectors, .. } => *sectors,
         }
     }
 
@@ -278,11 +293,13 @@ mod sys {
         let mut io = DmIoctl::new(name)?;
         call(&ctl, DM_DEV_CREATE, io.as_mut_bytes()).with_context(|| format!("create device-mapper device {name}"))?;
         let dev = decode(io.dev);
+        let node = PathBuf::from(format!("/dev/block/dm-{}", dev.1));
         let up = (|| -> Result<()> {
             let mut table = table_load(name, targets, readonly)?;
             call(&ctl, DM_TABLE_LOAD, &mut table).with_context(|| format!("load the table of {name}"))?;
             let mut resume = DmIoctl::new(name)?;
-            call(&ctl, DM_DEV_SUSPEND, resume.as_mut_bytes()).with_context(|| format!("activate {name}"))
+            call(&ctl, DM_DEV_SUSPEND, resume.as_mut_bytes()).with_context(|| format!("activate {name}"))?;
+            wait_for(&node)
         })();
         match up {
             Ok(()) => Ok(dev),
@@ -448,10 +465,7 @@ mod tests {
 
     #[test]
     fn table_lists_targets_back_to_back() {
-        let targets = [
-            Target::Linear { sectors: 4_078_120, device: (259, 29), offset: 2048 },
-            Target::Zero { sectors: 8 },
-        ];
+        let targets = [Target::Linear { sectors: 4_078_120, device: (259, 29), offset: 2048 }, Target::Zero { sectors: 8 }];
         let buf = table_load("odm_b", &targets, true).unwrap();
         let (io, rest) = DmIoctl::read_from_prefix(&buf).unwrap();
         assert_eq!(&io.name[..6], b"odm_b\0");
@@ -507,10 +521,13 @@ mod tests {
         buf.extend_from_slice(&body);
         // What the kernel left of the buffer unfilled.
         buf.resize(buf.len() + 64, 0);
-        assert_eq!(lines(&buf, &io).unwrap(), [
-            Line { start: 0, sectors: 1_780_392, kind: "snapshot-merge".into(), text: "2048/233936 64".into() },
-            Line { start: 1_780_392, sectors: 8, kind: "linear".into(), text: "253:3 2048".into() },
-        ]);
+        assert_eq!(
+            lines(&buf, &io).unwrap(),
+            [
+                Line { start: 0, sectors: 1_780_392, kind: "snapshot-merge".into(), text: "2048/233936 64".into() },
+                Line { start: 1_780_392, sectors: 8, kind: "linear".into(), text: "253:3 2048".into() },
+            ]
+        );
         io.target_count = 3;
         assert!(lines(&buf[..312 + body.len()], &io).is_err(), "a target past the end");
     }

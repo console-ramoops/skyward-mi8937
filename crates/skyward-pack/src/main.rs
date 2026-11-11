@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 
 mod avb;
 
-use skyward_bootimg::{BootImage, Ramdisk};
+use skyward_bootimg::{BootImage, Format, Ramdisk};
 
 /// Builds Skyward recovery images from a device's own stock images.
 #[derive(Parser)]
@@ -54,7 +54,7 @@ enum Cmd {
         /// one, skyward-system-init built for the device and linked
         /// statically.
         #[arg(long)]
-        system_init: PathBuf,
+        system_init: Option<PathBuf>,
         /// The device configuration, devices/<codename>.toml.
         #[arg(long)]
         config: PathBuf,
@@ -67,6 +67,21 @@ enum Cmd {
         /// The monospaced typeface's licence, which goes with it.
         #[arg(long)]
         mono_license: PathBuf,
+        /// A file, or a whole folder, of the base to leave out of the packed
+        /// image, given as its path in the ramdisk. Repeatable.
+        #[arg(long = "drop")]
+        drop: Vec<String>,
+        /// A shell script init starts in place of the recovery program, which
+        /// then sits beside it as system/bin/skyward. For keeping a start-up
+        /// log where a recovery that works can read it afterwards.
+        #[arg(long)]
+        wrapper: Option<PathBuf>,
+        /// Maximum packed image size, in bytes, for a footerless device.
+        #[arg(long)]
+        partition_size: Option<usize>,
+        /// Maximum compressed ramdisk size, in bytes.
+        #[arg(long)]
+        ramdisk_limit: Option<usize>,
         #[arg(long)]
         out: PathBuf,
     },
@@ -97,7 +112,8 @@ fn main() -> Result<()> {
         }
         Cmd::Repack { image, out } => {
             let mut img = BootImage::read(&image)?;
-            img.ramdisk = Ramdisk::decode(&img.ramdisk)?.encode()?;
+            let format = Format::of(&img.ramdisk)?;
+            img.ramdisk = Ramdisk::decode(&img.ramdisk)?.encode(format)?;
             write(&out, &img, &img.to_bytes()?)
         }
         Cmd::Boot { kernel, ramdisk, out } => {
@@ -105,27 +121,51 @@ fn main() -> Result<()> {
             img.kernel = BootImage::read(&kernel)?.kernel;
             write(&out, &img, &img.to_bytes()?)
         }
-        Cmd::Recovery { stock, binary, system_init, config, font, mono, mono_license, out } => {
-            let size = partition_size(&stock)?;
+        Cmd::Recovery { stock, binary, system_init, config, font, mono, mono_license, drop, wrapper, partition_size, ramdisk_limit, out } => {
+            let size = footer_size(&stock)?;
             let mut img = BootImage::read(&stock)?;
+            let format = Format::of(&img.ramdisk)?;
             let mut rd = Ramdisk::decode(&img.ramdisk)?;
-            // A stock recovery ramdisk has no third-party tree; refuse to build
-            // on top of another custom recovery.
-            if let Some(e) = rd.entries.iter().find(|e| e.name == "FFiles" || e.name.starts_with("twres")) {
-                anyhow::bail!("{} holds {}, which is not a stock recovery", stock.display(), e.name);
+            for at in &drop {
+                let gone = rd.drop_at(at);
+                ensure!(gone > 0, "--drop {at} is not in the ramdisk of {}", stock.display());
+                println!("dropped {gone} entries, everything under {at}");
             }
             let read = |p: &PathBuf| std::fs::read(p).with_context(|| format!("read {}", p.display()));
-            skyward_config::DeviceConfig::load(&config)?;
-            rd.replace(paths::RECOVERY, read(&binary)?)?;
-            // Install scripts look for the commands a stock recovery lacks
-            // among its programs, and its unzip there too, a link to ziptool
-            // until it points here; the recovery binary is each of them.
-            let (_, recovery) = paths::RECOVERY.rsplit_once('/').expect("the recovery binary is in a folder");
+            let cfg = skyward_config::DeviceConfig::load(&config)?;
+            // Where init's service ends up: the program itself, or a script
+            // that starts the program and keeps its output. The commands an
+            // install script calls are links to whichever it starts, since
+            // that is the program that answers them.
+            let service = if wrapper.is_some() { "system/bin/skyward" } else { paths::RECOVERY };
+            match &wrapper {
+                Some(script) => {
+                    rd.add(service, 0o755, read(&binary)?)?;
+                    rd.replace(paths::RECOVERY, read(script)?)?;
+                    println!("init starts {service} through {}, the wrapper", paths::RECOVERY);
+                }
+                None => rd.replace(paths::RECOVERY, read(&binary)?)?,
+            }
+            let (_, recovery) = service.rsplit_once('/').expect("the recovery program is in a folder");
             for command in paths::COMMANDS {
+                // A TWRP base can carry regular avbctl/resetprop binaries;
+                // replace them with the same links used by a stock base.
+                rd.drop_at(command);
                 rd.link(command, recovery)?;
             }
-            rd.add(paths::SYSTEM_INIT, 0o755, read(&system_init)?)?;
+            ensure!(!cfg.device.ab || system_init.is_some(), "an A/B device requires --system-init");
+            if let Some(system_init) = &system_init {
+                rd.add(paths::SYSTEM_INIT, 0o755, read(system_init)?)?;
+            }
             rd.add(paths::CONFIG, 0o644, read(&config)?)?;
+            // What the phone's own table leaves out, this recovery needs to
+            // know anyway: it goes in a table of its own beside the phone's,
+            // where everything that reads the table reads it too.
+            if !cfg.fstab.is_empty() {
+                let text: String = cfg.fstab.iter().map(|line| format!("{}\n", line.text())).collect();
+                rd.add(paths::FSTAB, 0o644, text.into_bytes())?;
+                println!("wrote {} line(s) the phone's own table has not to {}", cfg.fstab.len(), paths::FSTAB);
+            }
             rd.add(paths::FONT, 0o644, read(&font)?)?;
             rd.add(paths::MONO, 0o644, read(&mono)?)?;
             rd.add(paths::MONO_LICENSE, 0o644, read(&mono_license)?)?;
@@ -135,22 +175,50 @@ fn main() -> Result<()> {
                 rd.add(paths::TASK_PROFILES, 0o644, TASK_PROFILES.to_vec())?;
             }
             rd.add(paths::MTP_RC, 0o644, MTP_RC.to_vec())?;
+            rd.add(paths::KEYMASTER_RC, 0o644, KEYMASTER_RC.to_vec())?;
+            // An older recovery binds MTP from the kernel's own legacy
+            // function on the very request this one makes for its own, and
+            // whichever rule init reads last owns the port: the older rule
+            // goes, so the function Skyward serves is the one bound.
+            if let Some(data) = rd.find(paths::USB_RC).map(|entry| entry.data.clone()) {
+                let text = String::from_utf8_lossy(&data).into_owned();
+                match without_legacy_mtp(&text) {
+                    Some(text) => {
+                        rd.replace(paths::USB_RC, text.into_bytes())?;
+                        println!("took the base's own MTP binding out of {}", paths::USB_RC);
+                    }
+                    None => println!("{} binds no MTP of its own", paths::USB_RC),
+                }
+            }
             // On an unlocked device adbd keeps root when ro.secure is 0 and
             // lets any computer in without authorization when ro.adb.secure is
             // 0; init lets a later line of a property file override an earlier
             // one. update_engine refuses a package built before the recovery
             // itself unless both of the last two are set; the recovery checks
             // packages against the installed system instead.
-            let stock_props = &rd
-                .find(paths::PROP_DEFAULT)
-                .with_context(|| format!("{} is not in the ramdisk", paths::PROP_DEFAULT))?
-                .data;
+            let stock_props = &rd.find(paths::PROP_DEFAULT).with_context(|| format!("{} is not in the ramdisk", paths::PROP_DEFAULT))?.data;
             let mut props = without(stock_props, &BUILD_VERSION);
             props.extend_from_slice(b"\nro.secure=0\nro.adb.secure=0\nro.debuggable=1\nro.ota.allow_downgrade=true\n");
             rd.replace(paths::PROP_DEFAULT, props)?;
-            img.ramdisk = rd.encode()?;
+            img.ramdisk = rd.encode(format)?;
+            if let Some(limit) = ramdisk_limit {
+                ensure!(img.ramdisk.len() <= limit, "ramdisk is {} bytes, exceeding the {limit}-byte limit", img.ramdisk.len());
+            }
             let bytes = img.to_bytes()?;
-            write(&out, &img, &avb::footed(&bytes, "recovery", size, &Sha256::digest(&bytes))?)
+            if let Some(limit) = partition_size {
+                ensure!(bytes.len() <= limit, "image is {} bytes, exceeding the {limit}-byte partition", bytes.len());
+            }
+            // A base that fills its partition ends in an AVB footer and gets a
+            // fresh unsigned one; a base that is only its header, kernel and
+            // ramdisk, as the older Qualcomm recoveries are, is written as it
+            // came, footerless, because its bootloader never asks for one.
+            match size {
+                Some(size) => write(&out, &img, &avb::footed(&bytes, "recovery", size, &Sha256::digest(&bytes))?),
+                None => {
+                    println!("{} holds no AVB footer; the image is written without one", stock.display());
+                    write(&out, &img, &bytes)
+                }
+            }
         }
         Cmd::Stock { config, out } => {
             let stock = skyward_config::DeviceConfig::load(&config)?.stock.with_context(|| format!("{} names no stock build", config.display()))?;
@@ -182,7 +250,9 @@ fn take_stock_recovery(stock: &skyward_config::Stock, out: &Path) -> Result<()> 
                 println!("taking {name} out of the package: {bytes} bytes");
             }
         }
-        unpayload::Event::Extracted(image) => println!("took {} out: {} bytes", image.partition, image.size),
+        unpayload::Event::Extracted(image) => {
+            println!("took {} out: {} bytes", image.partition, image.size)
+        }
         unpayload::Event::Progress { .. } => {}
     };
     let taken = payload.extract(&options, &report).with_context(|| format!("take {RECOVERY} out of {}", stock.package))?;
@@ -194,9 +264,9 @@ fn take_stock_recovery(stock: &skyward_config::Stock, out: &Path) -> Result<()> 
     Ok(())
 }
 
-/// The size of the partition `stock` fills: all of it, as the phone and a
-/// full update package hold it, which its AVB footer ends.
-fn partition_size(stock: &Path) -> Result<usize> {
+/// The size of the partition `stock` fills, which its AVB footer ends, or
+/// `None` when the image is only its own sections and fills none of them.
+fn footer_size(stock: &Path) -> Result<Option<usize>> {
     let mut file = File::open(stock).with_context(|| format!("open {}", stock.display()))?;
     let size = file.metadata().with_context(|| format!("stat {}", stock.display()))?.len();
     let mut magic = [0u8; 4];
@@ -204,12 +274,10 @@ fn partition_size(stock: &Path) -> Result<usize> {
         file.seek(SeekFrom::Start(size - 64)).with_context(|| format!("seek in {}", stock.display()))?;
         file.read_exact(&mut magic).with_context(|| format!("read {}", stock.display()))?;
     }
-    ensure!(
-        &magic == b"AVBf",
-        "{} does not end in an AVB footer; give the whole recovery partition, as the phone or a full update package holds it",
-        stock.display()
-    );
-    Ok(usize::try_from(size)?)
+    if &magic != b"AVBf" {
+        return Ok(None);
+    }
+    Ok(Some(usize::try_from(size)?))
 }
 
 /// What a recovery image says about the build it is: the version and patch
@@ -229,6 +297,9 @@ const TASK_PROFILES: &[u8] = include_bytes!("task_profiles.json");
 /// The init rules that give the USB port file transfer beside adb, which a
 /// stock recovery does not offer.
 const MTP_RC: &[u8] = include_bytes!("mtp.rc");
+/// The key hardware services, as init has to know them for the lazy
+/// registration to work at all.
+const KEYMASTER_RC: &[u8] = include_bytes!("keymaster.rc");
 
 /// A property file without the lines that set any of `names`.
 fn without(props: &[u8], names: &[&str]) -> Vec<u8> {
@@ -242,29 +313,45 @@ fn without(props: &[u8], names: &[&str]) -> Vec<u8> {
     out
 }
 
+/// The base's own rule that binds its legacy MTP function, taken out. The
+/// rule is the trigger asking for both `sys.usb.ffs.ready` and the
+/// `mtp,adb` configuration, with the indented lines under it; the plain
+/// `mtp,adb` trigger that only starts adbd stays, since adbd has to be
+/// running for the port to offer both functions. `None` when the base binds
+/// no MTP of its own, which is what a newer one looks like.
+fn without_legacy_mtp(text: &str) -> Option<String> {
+    let mut kept: Vec<&str> = Vec::new();
+    let mut dropping = false;
+    let mut gone = false;
+    for line in text.lines() {
+        if let Some(header) = line.strip_prefix("on ") {
+            dropping = header.contains("sys.usb.ffs.ready") && header.contains("config=mtp,adb");
+            gone |= dropping;
+        } else if dropping && !(line.starts_with(char::is_whitespace) || line.is_empty()) {
+            dropping = false;
+        }
+        if !dropping {
+            kept.push(line);
+        }
+    }
+    gone.then(|| kept.join("\n") + "\n")
+}
+
 /// Write `bytes`, the image `img` makes, to `out`.
 fn write(out: &Path, img: &BootImage, bytes: &[u8]) -> Result<()> {
     std::fs::write(out, bytes).with_context(|| format!("write {}", out.display()))?;
-    println!(
-        "wrote {} ({} bytes kernel, {} bytes ramdisk, {} bytes in all)",
-        out.display(),
-        img.kernel.len(),
-        img.ramdisk.len(),
-        bytes.len()
-    );
+    println!("wrote {} ({} bytes kernel, {} bytes ramdisk, {} bytes in all)", out.display(), img.kernel.len(), img.ramdisk.len(), bytes.len());
     Ok(())
 }
 
 fn list(image: &Path) -> Result<()> {
     let img = BootImage::read(image)?;
     let h = &img.header;
-    println!(
-        "header v{}  kernel {} bytes  ramdisk {} bytes  {:?}",
-        h.header_version(),
-        img.kernel.len(),
-        img.ramdisk.len(),
-        h.osversionpatch
-    );
+    let osversionpatch = match h {
+        abootimg_oxide::Header::V0(h) => &h.osversionpatch,
+        abootimg_oxide::Header::V3(h) => &h.osversionpatch,
+    };
+    println!("header v{}  kernel {} bytes  ramdisk {} bytes  {:?}", h.header_version(), img.kernel.len(), img.ramdisk.len(), osversionpatch);
     if img.ramdisk.is_empty() {
         return Ok(());
     }
@@ -279,6 +366,34 @@ fn list(image: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const PORT: &str = "\
+on property:sys.usb.config=mtp,adb
+    start adbd
+
+on property:sys.usb.ffs.ready=1 && property:sys.usb.config=mtp,adb
+    write /config/usb_gadget/g1/idVendor 0x2717
+    symlink /config/usb_gadget/g1/functions/mtp.gs0 /config/usb_gadget/g1/configs/b.1/f1
+    write /config/usb_gadget/g1/UDC ${sys.usb.controller}
+    setprop sys.usb.state ${sys.usb.config}
+
+on property:sys.usb.config=adb
+    start adbd
+";
+
+    #[test]
+    fn the_base_s_own_mtp_binding_goes_and_its_adb_rules_stay() {
+        let text = without_legacy_mtp(PORT).expect("the base binds MTP of its own");
+        assert!(!text.contains("mtp.gs0"), "{text}");
+        assert!(text.contains("on property:sys.usb.config=mtp,adb\n    start adbd"), "asking for both functions still starts adbd: {text}");
+        assert!(text.contains("on property:sys.usb.config=adb"), "{text}");
+        assert_eq!(text.matches("on ").count(), 2, "{text}");
+    }
+
+    #[test]
+    fn a_base_that_binds_no_mtp_of_its_own_is_left_as_it_is() {
+        assert!(without_legacy_mtp("on boot\n    write /x 1\n").is_none());
+    }
 
     #[test]
     fn the_lines_that_set_a_name_are_the_only_ones_left_out() {
@@ -296,9 +411,8 @@ ro.vendor.build.security_patch=2026-10-01\nro.vendor.build.security_patch_level=
     #[test]
     fn the_profiles_name_all_the_recovery_asks_for() {
         let profiles: serde_json::Value = serde_json::from_slice(TASK_PROFILES).expect("the profiles are JSON");
-        let names = |key: &str| -> Vec<String> {
-            profiles[key].as_array().expect("a list").iter().map(|p| p["Name"].as_str().expect("a name").to_string()).collect()
-        };
+        let names =
+            |key: &str| -> Vec<String> { profiles[key].as_array().expect("a list").iter().map(|p| p["Name"].as_str().expect("a name").to_string()).collect() };
         let (plain, aggregate) = (names("Profiles"), names("AggregateProfiles"));
         // What libprocessgroup asks for when a program sets its scheduling
         // policy, and what the recovery's own init scripts give logd.
@@ -337,11 +451,11 @@ ro.vendor.build.security_patch=2026-10-01\nro.vendor.build.security_patch_level=
         let mut whole = vec![0u8; 8192];
         whole[8192 - 64..8192 - 60].copy_from_slice(b"AVBf");
         std::fs::write(&path, &whole).unwrap();
-        assert_eq!(partition_size(&path).unwrap(), 8192);
+        assert_eq!(footer_size(&path).unwrap(), Some(8192));
         std::fs::write(&path, &whole[..8000]).unwrap();
-        assert!(partition_size(&path).is_err(), "an image cut short of its partition's end");
+        assert_eq!(footer_size(&path).unwrap(), None, "an image cut short of its partition's end names none");
         std::fs::write(&path, b"AVBf").unwrap();
-        assert!(partition_size(&path).is_err(), "too short to end in a footer");
+        assert_eq!(footer_size(&path).unwrap(), None, "too short to end in a footer");
     }
 
     #[test]

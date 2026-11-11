@@ -8,7 +8,9 @@ license.workspace = true
 abootimg-oxide = "0.5.2"
 anyhow = { workspace = true }
 cpio = "0.4.1"
+flate2 = "1.1.10"
 libc = { workspace = true }
+liblzma = { version = "0.4.9", default-features = false, features = ["static"] }
 lz4_flex = "0.14.0"
 
 [dev-dependencies]

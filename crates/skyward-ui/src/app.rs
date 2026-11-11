@@ -12,9 +12,9 @@ use crate::glow::{self, GlowClock};
 use crate::lang::{Lang, Text};
 use crate::motion::{self, Spring};
 use crate::pages::{self, Band, Ctx};
-use crate::sprite::{Blurs, Sprite};
 use crate::search;
 use crate::settings::Settings;
+use crate::sprite::{Blurs, Sprite};
 use crate::term::{self, Term, TermKey};
 use crate::theme::Theme;
 use crate::tr;
@@ -209,7 +209,10 @@ pub enum SkywardStage {
     Download(Progress),
     /// The build is written into the recovery partitions and read back:
     /// bytes so far, of all.
-    Write { done: u64, total: u64 },
+    Write {
+        done: u64,
+        total: u64,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -246,6 +249,15 @@ pub const DATA_PARTITION: &str = "data";
 /// What work that needs the data partition is told while it is being
 /// opened.
 pub const DATA_OPENING: Text = ["正在打开 data 分区，请稍后再试", "正在開啟 data 分割區，請稍後再試", "Opening the data partition. Try again shortly"];
+
+/// What a backup is told where the phone has no shared storage to write
+/// into: the data partition made afresh has none until its own system has
+/// started once, and what `/sdcard` is meanwhile belongs to the recovery.
+pub const NO_SHARED_STORAGE: Text = [
+    "本机还没有内部存储：/sdcard 只是恢复模式内存盘里的一个目录。请先把系统开机一次，让它建立内部存储，或改用 U 盘备份。",
+    "本機還沒有內部儲存：/sdcard 只是復原模式記憶體碟裡的一個目錄。請先開機一次讓系統建立內部儲存，或改用 U 盤備份。",
+    "This phone has no shared storage yet: /sdcard is only a folder of the recovery's own ramdisk. Start its system once so it makes the shared storage, or back up to a USB drive.",
+];
 
 /// What an install is told while the last one has not ended.
 pub const INSTALL_UNFINISHED: Text = ["上一次安装尚未结束，请稍后再试", "上一次安裝尚未結束，請稍後再試", "The last install hasn't ended. Try again shortly"];
@@ -510,8 +522,8 @@ pub enum ItemState {
 pub enum ItemEnd {
     Erased,
     Unshared,
-    /// It holds this filesystem, none where blkid knows of none, and shares
-    /// no blocks.
+    /// It holds this filesystem, none where the partition names none, and
+    /// shares no blocks.
     NotShared(String),
     /// Nothing was wrong with the filesystem.
     Clean,
@@ -561,13 +573,43 @@ pub enum Switch {
     ShowPassword,
 }
 
-/// What a backup can take, in the order the backup page lists it.
-pub const BACKUP_PARTS: [Text; 4] = [
-    ["启动分区", "啟動分割區", "Boot partitions"],
-    ["系统分区", "系統分割區", "System partitions"],
-    ["data 分区", "data 分割區", "data partition"],
-    ["基带与 EFS", "基頻與 EFS", "Modem and EFS"],
-];
+/// One of the things a backup can take, and whether it is ticked. Which
+/// there are is the phone's own affair: the partitions a recovery can read
+/// whole, and what they are called, differ from phone to phone, so the
+/// runtime offers them by name and the page only lists them, saying each in
+/// the language being read with [`fmt::partition`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BackupChoice {
+    /// The partition's own name, or `data` for the data partition's files.
+    pub name: String,
+    /// Where it is read from or mounted, as the phone's own table says: the
+    /// page's second line, which needs no words of its own.
+    pub hint: String,
+    pub on: bool,
+}
+
+impl BackupChoice {
+    /// The names of those ticked, in the order given.
+    pub fn chosen(list: &[BackupChoice]) -> Vec<String> {
+        list.iter().filter(|c| c.on).map(|c| c.name.clone()).collect()
+    }
+
+    /// Whether any is ticked at all.
+    pub fn any(list: &[BackupChoice]) -> bool {
+        list.iter().any(|c| c.on)
+    }
+
+    /// Whether the one named `name` is ticked.
+    pub fn picked(list: &[BackupChoice], name: &str) -> bool {
+        list.iter().any(|c| c.on && c.name == name)
+    }
+
+    /// The same list with every one ticked, which is what a backup found in
+    /// a folder is restored by at first.
+    pub fn all(list: &[String]) -> Vec<BackupChoice> {
+        list.iter().map(|name| BackupChoice { name: name.clone(), hint: String::new(), on: true }).collect()
+    }
+}
 
 /// A backup found in a place's Skyward/backups folder.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -587,8 +629,9 @@ pub struct Held {
     pub made: i64,
     /// The bytes its files take.
     pub size: u64,
-    /// Which of [`BACKUP_PARTS`] it holds.
-    pub parts: [bool; 4],
+    /// The partitions and files it holds, by the names a backup is chosen
+    /// by: what its manifest lists, in the order it lists them.
+    pub names: Vec<String>,
     /// The phone it was made on, by its codename, the system it ran, as
     /// its version reads, and the slot it was made from.
     pub device: String,
@@ -633,7 +676,9 @@ pub enum BackupEnd {
     Saved(String),
     /// A backup restored, but for what it held in the folders of users gone
     /// since, which only the system makes: where those were.
-    Restored { unmade: Vec<String> },
+    Restored {
+        unmade: Vec<String>,
+    },
     /// Stopped as asked: a backup stopped leaves nothing of itself, and a
     /// restore stops only while nothing is written.
     Stopped,
@@ -679,10 +724,15 @@ pub struct FileRow {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum FileKind {
     /// A folder, and how many entries it holds when it can be read.
-    Folder { items: Option<usize> },
+    Folder {
+        items: Option<usize>,
+    },
     File,
     /// A symbolic link: where it points, and whether that is a folder.
-    Link { target: String, folder: bool },
+    Link {
+        target: String,
+        folder: bool,
+    },
     /// A device, socket or pipe.
     Special,
 }
@@ -846,6 +896,9 @@ impl Data {
 pub enum Confirm {
     Reboot,
     Wipe,
+    /// Make one partition afresh, its row on the wipe page having been
+    /// tapped and its swipe come to its end.
+    Format,
     Flash,
     Backup,
     Restore,
@@ -901,8 +954,7 @@ pub enum Wipe {
 }
 
 /// What the wipe page offers, in the order it lists them.
-pub const WIPES: [Wipe; 9] =
-    [Wipe::All, Wipe::AppData, Wipe::Media, Wipe::AppCaches, Wipe::SystemCaches, Wipe::Art, Wipe::Logs, Wipe::Updates, Wipe::Cache];
+pub const WIPES: [Wipe; 9] = [Wipe::All, Wipe::AppData, Wipe::Media, Wipe::AppCaches, Wipe::SystemCaches, Wipe::Art, Wipe::Logs, Wipe::Updates, Wipe::Cache];
 
 /// A part of the phone that erasing goes through, in the order it does.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -912,6 +964,10 @@ pub enum Part {
     Cache,
     /// /metadata, which holds the key the data partition is opened with.
     Metadata,
+    /// The partition the system runs from.
+    System,
+    /// The partition the vendor files are on.
+    Vendor,
     /// The parts of the data partition the wipe page names.
     AppData,
     Media,
@@ -950,6 +1006,10 @@ pub enum EraseStop {
     NotRebuilt,
     /// The phone has no cache partition.
     NoCache,
+    /// The phone has no /metadata partition.
+    NoMetadata,
+    /// The phone has no partition of this name.
+    NoPartition(String),
     /// The data partition is erased already, and holds nothing until the
     /// system makes it afresh.
     Erased,
@@ -1013,28 +1073,50 @@ pub enum Install {
     Waiting,
     /// The package of `size` bytes is looked at; a zip's signature is
     /// checked, once the installer tells how far.
-    Checking { size: u64, stage: Option<Stage> },
+    Checking {
+        size: u64,
+        stage: Option<Stage>,
+    },
     /// An image waits to be told where it goes.
     Choosing(Choice),
     /// An update waits for the user to agree: the version it brings, and
     /// whether all user data is erased after it.
-    Confirming { version: Option<String>, wipe: bool },
+    Confirming {
+        version: Option<String>,
+        wipe: bool,
+    },
     /// `overwriting` says whether the update writes over the running
     /// system.
-    Updating { version: Option<String>, stage: Option<Stage>, overwriting: bool },
-    Flashing { partition: &'static str, stage: Option<Stage> },
+    Updating {
+        version: Option<String>,
+        stage: Option<Stage>,
+        overwriting: bool,
+    },
+    Flashing {
+        partition: &'static str,
+        stage: Option<Stage>,
+    },
     /// A zip with an install script waits for the user to agree to run it.
     ConfirmingScript,
     /// A system to install beside the installed one waits for the room its
     /// root takes to be chosen.
     SystemChoosing(SystemChoice),
     /// The system is being installed: its name, and how far.
-    Systeming { name: String, stage: Option<Stage> },
+    Systeming {
+        name: String,
+        stage: Option<Stage>,
+    },
     /// Its install script is made ready and then, once `running`, runs; how
     /// far it says it is, once it says.
-    Scripting { stage: Option<Stage>, running: bool },
+    Scripting {
+        stage: Option<Stage>,
+        running: bool,
+    },
     /// `damage` is what a failure may have left broken.
-    Finished { outcome: Outcome, damage: Option<Damage> },
+    Finished {
+        outcome: Outcome,
+        damage: Option<Damage>,
+    },
     /// In rescue, all user data is being erased, as the computer asked.
     Wiping,
     /// In rescue, erasing all user data ended: done, or why it stopped.
@@ -1170,11 +1252,16 @@ pub enum Action {
     /// Try opening the data partition again, after it did not open.
     OpenData,
     Back,
-    Theme { dark: bool },
+    Theme {
+        dark: bool,
+    },
     Toggle(Switch),
     RebootTarget(usize),
     /// Choose or leave out what the wipe page erases.
     WipeItem(Wipe),
+    /// Tick or untick one of the wipe page's partitions, to be made afresh
+    /// when its swipe is drawn.
+    Format(Part),
     /// A slider's track: touching or dragging it sets the slider's level.
     Slider(Slider),
     /// Mount or unmount the mount page's partition at this index.
@@ -1203,14 +1290,13 @@ pub enum Action {
     TimeZone(usize),
     /// Speak this language.
     Language(Lang),
-    /// Tick or untick a part of the backup, by its place in
-    /// [`BACKUP_PARTS`].
+    /// Tick or untick the offered partition at this place in the page's list.
     BackupPart(usize),
     /// Send the backup to this place.
     BackupTo(Place),
     /// Open a backup found, by its place in the list, to restore it.
     OpenBackup(usize),
-    /// Tick or untick a part of the backup being restored.
+    /// Tick or untick one of what the backup being restored holds.
     RestorePart(usize),
     /// Stop backing up, or checking a backup before it is restored.
     StopBackup,
@@ -1599,6 +1685,17 @@ pub struct State {
     pub wipe: [bool; WIPES.len()],
     /// The phone has a cache partition, which the wipe page then offers.
     pub cache_partition: bool,
+    /// The phone has a /metadata partition, which the wipe page then offers
+    /// to make afresh.
+    pub metadata_partition: bool,
+    /// The partitions the wipe page offers to make afresh, in the order the
+    /// phone's configuration asks and only where the phone has them.
+    pub formats: Vec<Part>,
+    /// The partitions whose rows the page has chosen to make afresh, in
+    /// the order it lists them; empty while the swipe stands for what the
+    /// page has chosen to wipe. **More than one may be chosen**, and the
+    /// swipe then makes each of them afresh in turn.
+    pub format: Vec<Part>,
     /// How many folders of its own the phone keeps logs in on the data
     /// partition, which erasing the logs takes in.
     pub phone_logs: usize,
@@ -1618,6 +1715,10 @@ pub struct State {
     /// The phone keeps its recovery in a partition of each slot, which the
     /// install page then offers to keep Skyward in.
     pub recovery_partitions: bool,
+    /// The phone has two sets of partitions, one of them updated behind the
+    /// other. Where it has one, there is no staged update to read, merge or
+    /// search for, so nothing about a second slot is offered anywhere.
+    pub slots: bool,
     /// Skyward goes back into the recovery partitions an install writes
     /// over.
     pub keep_recovery: bool,
@@ -1628,17 +1729,18 @@ pub struct State {
     /// it could not.
     pub mounts: Result<Vec<MountRow>, String>,
     pub mount_failure: Option<MountFailure>,
-    /// Which of [`BACKUP_PARTS`] a backup takes.
-    pub backup: [bool; 4],
+    /// What a backup can take on this phone, in the order the page lists
+    /// them, and which of them is ticked. The runtime offers the names.
+    pub backup: Vec<BackupChoice>,
     /// Where a backup goes.
     pub backup_to: Place,
     pub compress: bool,
     pub verify: bool,
     /// The backups found, newest first, those that cannot be read last.
     pub backups: Vec<BackupEntry>,
-    /// The backup the restore page shows, as it was found, and which of its
-    /// parts to restore.
-    pub restore: Option<(BackupEntry, [bool; 4])>,
+    /// The backup the restore page shows, as it was found, and which of what
+    /// it holds to restore.
+    pub restore: Option<(BackupEntry, Vec<BackupChoice>)>,
     /// Backing up or restoring under way, or how it last ended.
     pub backup_job: Option<BackupJob>,
     /// Which logs to export: the recovery's, the kernel's.
@@ -1768,6 +1870,9 @@ impl Default for State {
             reboot: 0,
             wipe: [false; WIPES.len()],
             cache_partition: false,
+            metadata_partition: false,
+            formats: Vec::new(),
+            format: Vec::new(),
             phone_logs: 0,
             pattern: Vec::new(),
             confirm: 0.0,
@@ -1777,11 +1882,12 @@ impl Default for State {
             script_output: Vec::new(),
             check_signature: false,
             recovery_partitions: false,
+            slots: false,
             keep_recovery: true,
             reflash: None,
             mounts: Ok(Vec::new()),
             mount_failure: None,
-            backup: [true, true, false, true],
+            backup: Vec::new(),
             backup_to: Place::Storage,
             compress: false,
             verify: true,
@@ -1915,6 +2021,7 @@ impl State {
         match screen {
             Screen::Wlan => self.wlan.is_some(),
             Screen::SkywardUpdate => self.wlan.is_some() && self.recovery_partitions,
+            Screen::Update => self.slots,
             Screen::Systems => self.dual_boot,
             _ => true,
         }
@@ -1961,7 +2068,9 @@ pub enum Effect {
     /// screenshots in the owner's shared storage where `storage` says it is
     /// open, and otherwise held until it is, telling how it went with
     /// [`App::screenshot_saved`].
-    Screenshot { storage: bool },
+    Screenshot {
+        storage: bool,
+    },
     /// Offer internal storage to a computer over USB, or stop.
     FileTransfer(bool),
     /// Start receiving a package over USB.
@@ -1974,7 +2083,10 @@ pub enum Effect {
     InstallPath(String),
     /// Write the image the installer holds to `partition` in the slots
     /// `pick` means.
-    Flash { partition: &'static str, pick: Pick },
+    Flash {
+        partition: &'static str,
+        pick: Pick,
+    },
     /// Stop waiting for the computer, for where an image goes, or for an
     /// update to be agreed to.
     Cancel,
@@ -1997,7 +2109,9 @@ pub enum Effect {
     /// [`App::set_systems`] or [`App::systems_work_failed`].
     RemoveSystem,
     /// Install the system the installer holds with a root of `size` bytes.
-    InstallSystem { size: u64 },
+    InstallSystem {
+        size: u64,
+    },
     /// Mount the slot's partition with this base name, such as `system`.
     Mount(String),
     /// Unmount the slot's partition with this base name.
@@ -2014,7 +2128,15 @@ pub enum Effect {
     /// Open the own files of `user` with what they entered at their screen
     /// lock, telling what still waits with [`App::data_waiting`] or why it
     /// did not open with [`App::unlock_failed`].
-    Unlock { user: u32, code: String },
+    Unlock {
+        user: u32,
+        /// What was entered, as the phone keeps it: a password or a PIN as
+        /// its characters, and **a pattern as the dots themselves**, each
+        /// numbered from nought in the order the finger joins them — not the
+        /// numbers drawn on them, which is a different thing entirely and one
+        /// the secure world does not recognise.
+        code: Vec<u8>,
+    },
     /// Hand the USB port back from fastboot to adb, bring up what the
     /// recovery runs from the slot's partitions, then show its pages with
     /// [`App::enter_recovery`].
@@ -2022,6 +2144,10 @@ pub enum Effect {
     /// Erase all user data, as a factory reset does, telling how it goes
     /// with [`App::erase_at`] and [`App::erase_ended`].
     FactoryReset,
+    /// Make the partitions the wipe page has ticked afresh, in the order it
+    /// lists them, telling how it goes with [`App::erase_at`],
+    /// [`App::erase_progress`] and [`App::erase_ended`].
+    Format(Vec<Part>),
     /// Erase what the wipe page has chosen, [`Wipe::All`] as a factory
     /// reset does, telling how it goes with [`App::erase_at`],
     /// [`App::erase_progress`] and [`App::erase_ended`].
@@ -2043,13 +2169,24 @@ pub enum Effect {
     TermInput(Vec<u8>),
     /// Copy or move an entry into a folder; with no choice made yet, a name
     /// taken there is told with [`App::file_clash`] instead of going on.
-    Paste { op: FileOp, path: String, into: String, clash: Option<ClashChoice> },
+    Paste {
+        op: FileOp,
+        path: String,
+        into: String,
+        clash: Option<ClashChoice>,
+    },
     /// Give an entry a new name; how it went comes back with
     /// [`App::renamed`].
-    Rename { path: String, name: String },
+    Rename {
+        path: String,
+        name: String,
+    },
     /// Give an entry these permission bits; how it went comes back with
     /// [`App::mode_set`].
-    SetMode { path: String, mode: u32 },
+    SetMode {
+        path: String,
+        mode: u32,
+    },
     /// Read the file at this path to edit it, as much as
     /// [`editor::MAX_BYTES`] and one byte more, telling what it holds with
     /// [`App::text_opened`].
@@ -2057,7 +2194,10 @@ pub enum Effect {
     /// Write `text` as the contents of the file at `path`, which keeps what
     /// it has beside them; how it went comes back with
     /// [`App::text_saved`].
-    SaveText { path: String, text: String },
+    SaveText {
+        path: String,
+        text: String,
+    },
     /// Delete an entry, folders whole.
     Delete(String),
     /// Stop the work on files under way.
@@ -2077,25 +2217,47 @@ pub enum Effect {
     /// [`App::part_at`], [`App::part_ended`] and [`App::part_work_ended`];
     /// making the data partition afresh as another filesystem is a factory
     /// reset, which tells as erasing tells.
-    Filesystem { name: String, action: FsAction },
+    Filesystem {
+        name: String,
+        action: FsAction,
+    },
     /// Save the logs chosen, the recovery's own and the kernel's, into a
     /// folder of their own in internal storage or the temporary folder,
     /// saying where with [`App::report`].
-    ExportLogs { recovery: bool, kernel: bool, storage: bool },
-    /// Back up the parts ticked, by their place in [`BACKUP_PARTS`], into
-    /// a folder of their own in `place`, telling how it goes with
+    ExportLogs {
+        recovery: bool,
+        kernel: bool,
+        storage: bool,
+    },
+    /// Back up the partitions named, into a folder of their own in `place`,
+    /// telling how it goes with
     /// [`App::backup_started`], [`App::backup_plan`], [`App::backup_at`]
     /// and [`App::backup_ended`].
-    Backup { parts: [bool; 4], place: Place, compress: bool, verify: bool },
+    Backup {
+        parts: Vec<String>,
+        place: Place,
+        compress: bool,
+        verify: bool,
+    },
     /// Restore the parts ticked of the backup in the folder `name` of
     /// `place`, telling how it goes as a backup does.
-    Restore { place: Place, name: String, parts: [bool; 4] },
+    Restore {
+        place: Place,
+        name: String,
+        parts: Vec<String>,
+    },
     /// Look for backups in the places that can be read, telling what is
     /// found with [`App::set_backups`].
-    FindBackups { storage: bool, usb: bool },
+    FindBackups {
+        storage: bool,
+        usb: bool,
+    },
     /// Delete the backup in the folder `name` of `place`, telling how it
     /// went with [`App::backup_deleted`].
-    DeleteBackup { place: Place, name: String },
+    DeleteBackup {
+        place: Place,
+        name: String,
+    },
     /// Stop the backup under way, or the check before a restore.
     StopBackup,
     /// Read where the update stands, telling it with [`App::set_update`].
@@ -2104,7 +2266,12 @@ pub enum Effect {
     /// [`App::set_wlan`].
     Wlan(bool),
     ScanWlan,
-    JoinWlan { ssid: Vec<u8>, name: String, security: Security, password: Secret },
+    JoinWlan {
+        ssid: Vec<u8>,
+        name: String,
+        security: Security,
+        password: Secret,
+    },
     LeaveWlan,
     /// Ask the update server for the newest system, telling what it
     /// answered with [`App::update_checked`].
@@ -2132,20 +2299,42 @@ enum Drag {
     /// press began at a screen edge (true for the left one).
     /// `at` is when it came down: held long enough over an entry of the file
     /// manager, it opens what can be done with that entry.
-    Press { x: f32, y: f32, action: Option<Action>, edge: Option<bool>, at: u64 },
+    Press {
+        x: f32,
+        y: f32,
+        action: Option<Action>,
+        edge: Option<bool>,
+        at: u64,
+    },
     /// A press held long enough to have done its work; nothing it does
     /// counts until it lifts.
     Held,
-    Scroll { last: f32 },
+    Scroll {
+        last: f32,
+    },
     /// Swiping in from a screen edge, the finger now `x` across; the cue
     /// keeps to height `cy`, set by where the swipe began. Past the
     /// threshold, lifting goes back.
-    Edge { start: f32, from_left: bool, armed: bool, x: f32, cy: f32 },
+    Edge {
+        start: f32,
+        from_left: bool,
+        armed: bool,
+        x: f32,
+        cy: f32,
+    },
     Slider(Slider, Rect),
-    Confirm { which: Confirm, track: Rect, grab: f32 },
+    Confirm {
+        which: Confirm,
+        track: Rect,
+        grab: f32,
+    },
     /// Scrolling a terminal's screen back through what the shell wrote, or
     /// the editor's text, `carry` being the part of a row not yet scrolled.
-    History { last: f32, carry: f32, pitch: f32 },
+    History {
+        last: f32,
+        carry: f32,
+        pitch: f32,
+    },
     Pattern,
     /// A finger that landed just after the panel lit; nothing it does
     /// counts until it lifts.
@@ -3081,7 +3270,9 @@ impl App {
 
     /// Bring the bar and its title in or out as the page scrolls.
     fn follow_scroll(&mut self, now: u64) {
-        let Some((title, bar)) = self.bar_wanted() else { return };
+        let Some((title, bar)) = self.bar_wanted() else {
+            return;
+        };
         self.title.set(title, now);
         self.bar.set(bar, now);
         if self.title.moving(now) || self.bar.moving(now) {
@@ -3359,7 +3550,9 @@ impl App {
     pub fn term_ended(&mut self, end: TermEnd) {
         let (l, term) = (self.state.lang, self.term.as_mut().expect("only a shell that started ends"));
         let how = fmt::term_end(l, &end);
-        term.feed(tr!(l, "\r\n[{how}。按「回车」重新启动]\r\n", "\r\n[{how}。按「Enter」重新啟動]\r\n", "\r\n[{how}. Press Enter to start it again]\r\n").as_bytes());
+        term.feed(
+            tr!(l, "\r\n[{how}。按「回车」重新启动]\r\n", "\r\n[{how}。按「Enter」重新啟動]\r\n", "\r\n[{how}. Press Enter to start it again]\r\n").as_bytes(),
+        );
         term.running = false;
         if self.screen() == Screen::Terminal {
             self.refresh();
@@ -3626,7 +3819,9 @@ impl App {
     }
 
     pub fn wlan_mark(&self) -> Option<WlanMark> {
-        let Some(Joined { stage: Joining::Connected(link), .. }) = self.state.wlan.as_ref()?.joined.as_ref() else { return None };
+        let Some(Joined { stage: Joining::Connected(link), .. }) = self.state.wlan.as_ref()?.joined.as_ref() else {
+            return None;
+        };
         let t = self.state.traffic;
         let (speed, unit) = fmt::speed(t.rx + t.tx);
         Some(WlanMark { level: fmt::signal_level(link.signal), receiving: t.rx > 0, sending: t.tx > 0, speed, unit })
@@ -4147,7 +4342,9 @@ impl App {
     /// it scrolls into view; that done, make the About page field's dither,
     /// for that page to open without making it. Whether any is left to do.
     pub fn draw_ahead(&mut self, f: &Fonts, info: &DeviceInfo) -> bool {
-        let Some(frame) = &self.frame else { return false };
+        let Some(frame) = &self.frame else {
+            return false;
+        };
         let (held, h) = (frame.canvas.held(), frame.canvas.h);
         if self.cols < self.w {
             self.draw_cols(f, info, self.w);
@@ -4676,6 +4873,15 @@ impl App {
 
     /// Show the user what the runtime has to say about work it was asked
     /// to do.
+    /// What a backup can take on this phone: the partitions the runtime
+    /// reads whole, the data partition's files, and where each is read from
+    /// or mounted. Everything but the files is ticked to begin with, as the
+    /// parts were before: those files are the long job, and the rest is what
+    /// a person means when they say a backup.
+    pub fn set_backup_of(&mut self, offered: Vec<(String, String)>) {
+        self.state.backup = offered.into_iter().map(|(name, hint)| BackupChoice { on: name != "data", name, hint }).collect();
+    }
+
     pub fn report(&mut self, text: &str, now: u64) {
         self.say(text, now);
     }
@@ -4733,7 +4939,9 @@ impl App {
             return;
         }
         self.end_turn();
-        let Some(view) = self.shown.take() else { return };
+        let Some(view) = self.shown.take() else {
+            return;
+        };
         let mut left = self.backdrop.take().unwrap_or_else(|| Canvas::new(self.w, self.h));
         // The `<` comes up with the finger, before its page goes.
         let view = View { pressing: None, ..view };
@@ -4828,7 +5036,10 @@ impl App {
                 let changed = self.state.editor.as_ref().expect("the editor page shows a file").changed;
                 if changed && self.unsaved_warned.is_none_or(|at| now >= at + TOAST_MS) {
                     self.unsaved_warned = Some(now);
-                    self.say(l.pick(["修改尚未保存，再次返回将放弃修改", "修改尚未儲存，再次返回將捨棄修改", "Changes aren't saved. Go back again to discard them"]), now);
+                    self.say(
+                        l.pick(["修改尚未保存，再次返回将放弃修改", "修改尚未儲存，再次返回將捨棄修改", "Changes aren't saved. Go back again to discard them"]),
+                        now,
+                    );
                     return fx;
                 }
                 self.state.editor = None;
@@ -4899,7 +5110,11 @@ impl App {
                 let job = self.state.backup_job.as_ref().expect("the backup page shows work");
                 if job.outcome.is_none() {
                     let writing = job.restore && job.at.is_some_and(|a| !a.checking);
-                    let said = if writing { ["正在恢复，请等待恢复完成", "正在還原，請等待還原完成", "Restoring. Wait for it to finish"] } else { WAIT_OR_STOP };
+                    let said = if writing {
+                        ["正在恢复，请等待恢复完成", "正在還原，請等待還原完成", "Restoring. Wait for it to finish"]
+                    } else {
+                        WAIT_OR_STOP
+                    };
                     self.say(l.pick(said), now);
                     return fx;
                 }
@@ -5008,9 +5223,7 @@ impl App {
                     *overwriting = true;
                 }
             }
-            Event::Image { kind, size, partitions } => {
-                *install = Install::Choosing(Choice { kind, size, partitions, partition: 0, pick: Pick::Current })
-            }
+            Event::Image { kind, size, partitions } => *install = Install::Choosing(Choice { kind, size, partitions, partition: 0, pick: Pick::Current }),
             Event::Script => *install = Install::ConfirmingScript,
             Event::System { name, version, sizes } => *install = Install::SystemChoosing(SystemChoice { name, version, sizes, size: 0 }),
             Event::Running => {
@@ -5033,7 +5246,9 @@ impl App {
                 _ => {}
             },
             Event::Reflashed(reflash) => self.state.reflash = Some(reflash),
-            Event::Wipe | Event::Reboot(_) => unreachable!("the runtime carries out what rescue asks of it"),
+            Event::Wipe | Event::Reboot(_) => {
+                unreachable!("the runtime carries out what rescue asks of it")
+            }
             Event::Done(outcome) | Event::Finished(outcome) => {
                 let damage = match (&outcome, &*install) {
                     (Outcome::Failed(_), Install::Updating { overwriting: true, .. }) => Some(Damage::System),
@@ -5067,7 +5282,9 @@ impl App {
             Screen::Systems => vec![Effect::ReadSystems],
             Screen::Restore => vec![self.find_backups()],
             Screen::Files => vec![Effect::ReadDir(self.state.files.path.clone())],
-            Screen::Choose(place) if self.state.place_open(place) => vec![Effect::ReadPlace(place, self.state.folder(s).path.clone())],
+            Screen::Choose(place) if self.state.place_open(place) => {
+                vec![Effect::ReadPlace(place, self.state.folder(s).path.clone())]
+            }
             Screen::Search => {
                 self.state.search.clear();
                 self.state.layer = Layer::Letters;
@@ -5098,7 +5315,9 @@ impl App {
                 self.state.skyward_check = SkywardCheck::Asking;
                 vec![Effect::CheckSkyward]
             }
-            Screen::Wlan if self.state.wlan.as_ref().is_some_and(|w| w.power == Power::On) => vec![Effect::ScanWlan],
+            Screen::Wlan if self.state.wlan.as_ref().is_some_and(|w| w.power == Power::On) => {
+                vec![Effect::ScanWlan]
+            }
             _ => Vec::new(),
         }
     }
@@ -5193,9 +5412,34 @@ impl App {
                 self.state.reboot = i;
                 self.refresh();
             }
-            // Everything takes in every part, so choosing it leaves the
-            // parts out, and choosing a part on its own leaves it out.
+            // A partition's row is a tick rather than a choice of one:
+            // choosing it adds it to what the swipe will make afresh, and
+            // choosing it again takes it back out. Choosing anything to wipe
+            // leaves the partitions out, since the swipe stands for one ask
+            // at a time.
+            Action::Format(part) => {
+                match self.state.format.iter().position(|&chosen| chosen == part) {
+                    Some(at) => {
+                        self.state.format.remove(at);
+                    }
+                    None => {
+                        // Ticking a partition leaves out what the page had
+                        // chosen to wipe, since the swipe stands for one ask
+                        // at a time -- and the other way round below.
+                        self.state.wipe = [false; WIPES.len()];
+                        self.state.format.push(part);
+                        // **Kept in the order the page lists them**, whatever
+                        // order they are ticked in, so the page that follows
+                        // the work reads the way the page it was asked on did.
+                        let listed = self.state.formats.clone();
+                        self.state.format.sort_by_key(|part| listed.iter().position(|p| p == part));
+                    }
+                }
+                self.refresh();
+            }
             Action::WipeItem(item) => {
+                // Choosing what a wipe takes in leaves the format ask.
+                self.state.format.clear();
                 let k = WIPES.iter().position(|&w| w == item).expect("the page offers only what it lists");
                 let on = !self.state.wipe[k];
                 match (on, item) {
@@ -5364,7 +5608,7 @@ impl App {
                 self.refresh();
             }
             Action::BackupPart(k) => {
-                self.state.backup[k] = !self.state.backup[k];
+                self.state.backup[k].on = !self.state.backup[k].on;
                 self.refresh();
             }
             Action::BackupTo(place) => {
@@ -5374,14 +5618,15 @@ impl App {
             // All a backup holds is ticked to restore at first.
             Action::OpenBackup(i) => {
                 let entry = self.state.backups[i].clone();
-                let parts = entry.held.as_ref().map_or([false; 4], |h| h.parts);
+                let names = entry.held.as_ref().map_or(Vec::new(), |h| h.names.clone());
+                let parts = BackupChoice::all(&names);
                 self.state.restore = Some((entry, parts));
                 self.state.asking_delete = false;
                 self.open(Screen::RestoreBackup);
             }
             Action::RestorePart(k) => {
                 let (_, parts) = self.state.restore.as_mut().expect("the restore page shows a backup");
-                parts[k] = !parts[k];
+                parts[k].on = !parts[k].on;
                 self.refresh();
             }
             Action::StopBackup => {
@@ -5431,7 +5676,9 @@ impl App {
                 self.refresh_text();
             }
             Action::TermKey(key) => {
-                let Some(term) = self.term.as_mut() else { return Vec::new() };
+                let Some(term) = self.term.as_mut() else {
+                    return Vec::new();
+                };
                 let bytes = term.key(key);
                 let running = term.running;
                 self.refresh();
@@ -5506,45 +5753,38 @@ impl App {
             Action::JoinNetwork(i) => {
                 let w = self.state.wlan.as_ref().expect("networks show on a phone whose WLAN is brought up");
                 // A scan may have changed the list since the page was drawn.
-                let Some(network) = w.networks.get(i).cloned() else { return Vec::new() };
+                let Some(network) = w.networks.get(i).cloned() else {
+                    return Vec::new();
+                };
                 if w.joined.as_ref().is_some_and(|j| j.ssid == network.ssid) {
                     return self.act(Action::OpenJoined, now);
                 }
                 match network.security {
                     Security::Wep => self.say(l.pick(["暂不支持 WEP 加密的网络", "尚不支援 WEP 加密的網路", "WEP networks aren't supported"]), now),
-                    Security::Enterprise => {
-                        self.say(l.pick(["暂不支持需要账号登录的网络", "尚不支援需要帳號登入的網路", "Networks that need an account sign-in aren't supported"]), now)
-                    }
+                    Security::Enterprise => self.say(
+                        l.pick(["暂不支持需要账号登录的网络", "尚不支援需要帳號登入的網路", "Networks that need an account sign-in aren't supported"]),
+                        now,
+                    ),
                     s if s.password() => self.ask_password(network),
-                    _ => {
-                        return vec![Effect::JoinWlan {
-                            ssid: network.ssid,
-                            name: network.name,
-                            security: network.security,
-                            password: Secret::default(),
-                        }]
-                    }
+                    _ => return vec![Effect::JoinWlan { ssid: network.ssid, name: network.name, security: network.security, password: Secret::default() }],
                 }
             }
             Action::NetworkDetails(i) => {
                 let w = self.state.wlan.as_ref().expect("networks show on a phone whose WLAN is brought up");
-                let Some(network) = w.networks.get(i).cloned() else { return Vec::new() };
+                let Some(network) = w.networks.get(i).cloned() else {
+                    return Vec::new();
+                };
                 self.state.details = Some(network);
                 self.open(Screen::WlanNetwork);
             }
             Action::OpenJoined => {
                 let w = self.state.wlan.as_ref().expect("a network is chosen on a phone whose WLAN is brought up");
-                let Some(j) = w.joined.clone() else { return Vec::new() };
+                let Some(j) = w.joined.clone() else {
+                    return Vec::new();
+                };
                 // As found, where it still is; as it was chosen otherwise.
                 let found = w.networks.iter().find(|n| n.ssid == j.ssid).cloned();
-                let network = found.unwrap_or(Network {
-                    ssid: j.ssid,
-                    name: j.name,
-                    signal: 0,
-                    frequency: 0,
-                    bands: Default::default(),
-                    security: j.security,
-                });
+                let network = found.unwrap_or(Network { ssid: j.ssid, name: j.name, signal: 0, frequency: 0, bands: Default::default(), security: j.security });
                 if j.stage == Joining::WrongPassword {
                     self.ask_password(network);
                 } else {
@@ -5751,7 +5991,9 @@ impl App {
             self.state.layer = Layer::Letters;
         }
         self.refresh();
-        let Some(term) = self.term.as_mut() else { return Vec::new() };
+        let Some(term) = self.term.as_mut() else {
+            return Vec::new();
+        };
         if !term.running {
             return if cap == Cap::Enter { vec![Effect::StartShell(self.shell_folder.clone())] } else { Vec::new() };
         }
@@ -5766,7 +6008,7 @@ impl App {
     /// Send what was entered at the screen lock of the user whose own
     /// files wait. It is taken as it is sent, so the dots clear while it is
     /// checked, and nothing more is entered until it has been.
-    fn unlock(&mut self, code: String) -> Vec<Effect> {
+    fn unlock(&mut self, code: Vec<u8>) -> Vec<Effect> {
         let Data::Locked { user, keys, .. } = self.state.data else { unreachable!("only a screen lock waiting takes what is entered") };
         self.state.data = Data::Locked { user, keys, checking: true };
         self.refresh();
@@ -5879,7 +6121,7 @@ impl App {
                 Screen::Decrypt if self.state.code.is_empty() => self.say(l.pick(["请输入锁屏密码", "請輸入螢幕鎖定密碼", "Enter the screen lock"]), now),
                 Screen::Decrypt => {
                     let code = std::mem::take(&mut self.state.code);
-                    return self.unlock(code);
+                    return self.unlock(code.into_bytes());
                 }
                 // A name the folder cannot take is turned down here, in
                 // the user's words; an unchanged one leaves the page.
@@ -5919,7 +6161,12 @@ impl App {
                         0 => (Field::Name, Some(l.pick(["请输入网络名称", "請輸入網路名稱", "Enter the network's name"]).to_string())),
                         n if n > SSID_MAX => (
                             Field::Name,
-                            Some(tr!(l, "网络名称不能超过 {SSID_MAX} 个字符", "網路名稱不能超過 {SSID_MAX} 個字元", "A network's name can't be over {SSID_MAX} characters")),
+                            Some(tr!(
+                                l,
+                                "网络名称不能超过 {SSID_MAX} 个字符",
+                                "網路名稱不能超過 {SSID_MAX} 個字元",
+                                "A network's name can't be over {SSID_MAX} characters"
+                            )),
                         ),
                         _ if a.security.password() => (Field::Password, refused(l, a.security, &self.state.password).map(str::to_string)),
                         _ => (Field::Name, None),
@@ -6056,8 +6303,7 @@ impl App {
                     // A search bar folding away answers only on what is
                     // left of it.
                     let fr = self.frame.as_ref();
-                    fr.and_then(|fr| fr.hit(x, y + scroll).filter(|h| fr.shown(h.rect, scroll).is_some_and(|r| r.contains(x, y))))
-                        .map(|h| (h.action, h.rect))
+                    fr.and_then(|fr| fr.hit(x, y + scroll).filter(|h| fr.shown(h.rect, scroll).is_some_and(|r| r.contains(x, y)))).map(|h| (h.action, h.rect))
                 };
                 let action = hit.map(|h| h.0);
                 // A row of the page darkens behind its words a moment after
@@ -6231,10 +6477,8 @@ impl App {
         if held != self.state.held {
             let was = std::mem::replace(&mut self.state.held, held);
             // Only the rows of what is let go and what is held change.
-            let rects: Option<Vec<Rect>> = self
-                .frame
-                .as_ref()
-                .and_then(|fr| [was, held].into_iter().flatten().map(|a| fr.hits.iter().find(|h| h.action == a).map(|h| h.rect)).collect());
+            let rects: Option<Vec<Rect>> =
+                self.frame.as_ref().and_then(|fr| [was, held].into_iter().flatten().map(|a| fr.hits.iter().find(|h| h.action == a).map(|h| h.rect)).collect());
             match rects {
                 Some(rects) => rects.into_iter().for_each(|r| self.refresh_rows(r.y.floor() as u32, (r.y + r.h).ceil() as u32)),
                 None => self.refresh(),
@@ -6371,9 +6615,7 @@ impl App {
                 match self.keys.then(|| self.lit()).flatten() {
                     // Held on a swipe-to-confirm control, the key slides
                     // its knob along as a finger would.
-                    Some(Spot { stop: Stop::Hit(Action::Confirm(which)), rect, .. }) => {
-                        self.button = Some((key, Press::Slide { which, track: rect, at }))
-                    }
+                    Some(Spot { stop: Stop::Hit(Action::Confirm(which)), rect, .. }) => self.button = Some((key, Press::Slide { which, track: rect, at })),
                     Some(spot) => self.button = Some((key, Press::Power { spot, at })),
                     // Turning the screen off, the key ticks the motor.
                     None => {
@@ -6396,7 +6638,9 @@ impl App {
             Some((first, _)) if first == key => self.let_chord_go(now),
             _ => Vec::new(),
         };
-        let Some((down, press)) = self.button else { return fx };
+        let Some((down, press)) = self.button else {
+            return fx;
+        };
         if down != key {
             return fx;
         }
@@ -6421,7 +6665,9 @@ impl App {
     /// Whatever the button held down was doing comes to nothing until it is
     /// let go: a knob it slid goes back.
     fn drop_button(&mut self) {
-        let Some((key, press)) = self.button else { return };
+        let Some((key, press)) = self.button else {
+            return;
+        };
         if let Press::Slide { which, track, .. } = press {
             self.let_knob_go(which, track);
         }
@@ -6441,6 +6687,10 @@ impl App {
         let (l, mut fx) = (self.state.lang, Vec::new());
         match which {
             Confirm::Reboot => fx.push(Effect::Reboot(TARGETS[self.state.reboot])),
+            Confirm::Format => match self.state.format.is_empty() {
+                true => self.say(l.pick(["请选择要格式化的分区", "請選擇要格式化的分割區", "Choose what to format"]), now),
+                false => fx.push(Effect::Format(self.state.format.clone())),
+            },
             Confirm::Wipe => {
                 let chosen: Vec<Wipe> = WIPES.iter().zip(self.state.wipe).filter(|(_, on)| *on).map(|(&w, _)| w).collect();
                 match chosen.is_empty() {
@@ -6464,9 +6714,9 @@ impl App {
             }
             Confirm::Backup => {
                 let s = &self.state;
-                let refused = if !s.backup.contains(&true) {
+                let refused = if !BackupChoice::any(&s.backup) {
                     Some(["请选择要备份的内容", "請選擇要備份的內容", "Choose what to back up"])
-                } else if s.backup[2] && s.data != Data::Open {
+                } else if BackupChoice::picked(&s.backup, "data") && s.data != Data::Open {
                     Some(["备份 data 分区需先完成「解密」", "備份 data 分割區需先完成「解密」", "Decrypt before backing up the data partition"])
                 } else if s.place_open(s.backup_to) {
                     None
@@ -6478,7 +6728,7 @@ impl App {
                         (Place::UsbDrive, _) => USB_DRIVE_WANTED,
                     })
                 };
-                let backup = Effect::Backup { parts: s.backup, place: s.backup_to, compress: s.compress, verify: s.verify };
+                let backup = Effect::Backup { parts: BackupChoice::chosen(&s.backup), place: s.backup_to, compress: s.compress, verify: s.verify };
                 match refused {
                     Some(why) => self.say(l.pick(why), now),
                     None => fx.push(backup),
@@ -6486,11 +6736,14 @@ impl App {
             }
             Confirm::Restore => {
                 let (entry, parts) = self.state.restore.as_ref().expect("the restore page shows a backup");
-                let restore = Effect::Restore { place: entry.place, name: entry.name.clone(), parts: *parts };
-                if !parts.contains(&true) {
+                let restore = Effect::Restore { place: entry.place, name: entry.name.clone(), parts: BackupChoice::chosen(parts) };
+                if !BackupChoice::any(parts) {
                     self.say(l.pick(["请选择要恢复的内容", "請選擇要還原的內容", "Choose what to restore"]), now);
-                } else if parts[2] && self.state.data != Data::Open {
-                    self.say(l.pick(["恢复 data 分区需先完成「解密」", "還原 data 分割區需先完成「解密」", "Decrypt before restoring the data partition"]), now);
+                } else if BackupChoice::picked(parts, "data") && self.state.data != Data::Open {
+                    self.say(
+                        l.pick(["恢复 data 分区需先完成「解密」", "還原 data 分割區需先完成「解密」", "Decrypt before restoring the data partition"]),
+                        now,
+                    );
                 } else {
                     fx.push(restore);
                 }
@@ -6587,10 +6840,16 @@ impl App {
                 self.adjusting = !self.adjusting;
                 if self.adjusting {
                     let said = match which {
-                        Slider::Brightness => ["按音量键调节亮度，按电源键完成", "按音量鍵調整亮度，按電源鍵完成", "Set the brightness with the volume keys, then press the power key"],
-                        Slider::Vibration => {
-                            ["按音量键调节振动强度，按电源键完成", "按音量鍵調整震動強度，按電源鍵完成", "Set the vibration with the volume keys, then press the power key"]
-                        }
+                        Slider::Brightness => [
+                            "按音量键调节亮度，按电源键完成",
+                            "按音量鍵調整亮度，按電源鍵完成",
+                            "Set the brightness with the volume keys, then press the power key",
+                        ],
+                        Slider::Vibration => [
+                            "按音量键调节振动强度，按电源键完成",
+                            "按音量鍵調整震動強度，按電源鍵完成",
+                            "Set the vibration with the volume keys, then press the power key",
+                        ],
                     };
                     self.say(l.pick(said), now);
                 }
@@ -6600,7 +6859,14 @@ impl App {
             Stop::Dot(i) if self.state.pattern.last() == Some(&i) => self.drawn(now),
             Stop::Dot(i) => {
                 if self.state.pattern.is_empty() {
-                    self.say(l.pick(["连接完成后，在最后一个点上再按一次电源键", "連接完成後，在最後一個點上再按一次電源鍵", "When the pattern is done, press the power key again on its last dot"]), now);
+                    self.say(
+                        l.pick([
+                            "连接完成后，在最后一个点上再按一次电源键",
+                            "連接完成後，在最後一個點上再按一次電源鍵",
+                            "When the pattern is done, press the power key again on its last dot",
+                        ]),
+                        now,
+                    );
                 }
                 self.join(&self.theme(), i);
                 Vec::new()
@@ -6618,7 +6884,12 @@ impl App {
             self.say(self.state.lang.pick(["请至少连接 4 个点", "請至少連接 4 個點", "Connect at least 4 dots"]), now);
             return Vec::new();
         }
-        self.unlock(drawn.iter().map(|i| (b'1' + *i as u8) as char).collect())
+        // **A pattern is kept as the digits it is drawn on**, not as the
+        // number of each dot: Android turns each dot into `'1' + dot` when it
+        // makes the credential, so the pattern that joins 1, 2, 3, 6, 9 is
+        // the four bytes `12369` — measured, and the reason a pattern given
+        // as `[0, 1, 2, 5, 8]` is turned away as a wrong credential.
+        self.unlock(drawn.iter().map(|i| b'1' + *i as u8).collect())
     }
 
     /// A volume key: the first lights the control the keys were last on
@@ -6792,8 +7063,7 @@ impl App {
     fn first_in_view(&self, spots: &[Spot], scroll: f32) -> Option<usize> {
         let band = self.band(scroll);
         let k = spots.iter().position(|s| s.group == Group::Page && self.place(s, scroll).is_some_and(|r| within(r, band)));
-        k.or_else(|| spots.iter().position(|s| s.group == Group::Dock))
-            .or_else(|| spots.iter().position(|s| matches!(s.group, Group::Fixed | Group::Strip)))
+        k.or_else(|| spots.iter().position(|s| s.group == Group::Dock)).or_else(|| spots.iter().position(|s| matches!(s.group, Group::Fixed | Group::Strip)))
     }
 
     /// Where on screen `s` is with the page `offset` pixels down; nowhere
@@ -6863,7 +7133,9 @@ impl App {
     /// A page come to rest with its search bar part folded eases on from
     /// there to fold the bar away or unfold it whole, whichever is nearer.
     fn settle_fold(&mut self, now: u64) {
-        let Some(fr) = self.frame.as_ref() else { return };
+        let Some(fr) = self.frame.as_ref() else {
+            return;
+        };
         let at = self.top().1;
         let rest = fr.settle(at).min(self.max_scroll());
         if rest != at {
@@ -6991,7 +7263,9 @@ impl App {
 
     /// Add the dot under the finger to the pattern being drawn.
     fn trace(&mut self, t: &Theme, x: f32, y: f32) {
-        let Some((cx, cy, span)) = self.frame.as_ref().and_then(|fr| fr.pattern) else { return };
+        let Some((cx, cy, span)) = self.frame.as_ref().and_then(|fr| fr.pattern) else {
+            return;
+        };
         let reach = t.m.dp(widgets::PATTERN_REACH_DP);
         let dots = widgets::pattern_dots(cx, cy, span);
         if let Some(i) = dots.iter().position(|&(dx, dy)| (dx - x).hypot(dy - y) < reach) {
@@ -7023,8 +7297,12 @@ impl App {
     }
 
     fn repaint_pattern(&mut self, t: &Theme) {
-        let Some(fr) = self.frame.as_mut() else { return };
-        let Some((cx, cy, span)) = fr.pattern else { return };
+        let Some(fr) = self.frame.as_mut() else {
+            return;
+        };
+        let Some((cx, cy, span)) = fr.pattern else {
+            return;
+        };
         let r = span / 2.0 + t.m.dp(16.0);
         fr.canvas.fill_rect(cx - r, cy - r, r * 2.0, r * 2.0, t.pal.bg);
         widgets::pattern_lock(&mut fr.canvas, t, cx, cy, span, &self.state.pattern);
@@ -7244,7 +7522,6 @@ mod tests {
         fx
     }
 
-
     #[test]
     fn rows_open_pages_and_back_returns() {
         let (f, i) = (fonts(), info());
@@ -7359,7 +7636,7 @@ mod tests {
         let fr = app.frame(&f, &plain);
         let reboot = fr.hits.iter().find(|h| h.action == Action::Open(Screen::Reboot)).expect("a reboot row").rect;
         assert!(reboot.y + reboot.h <= SNUG as f32, "without the notice the rows fit the screen");
-        let i = DeviceInfo { snapshot: SnapshotState::Snapshotted, ..info() };
+        let i = DeviceInfo { slot: Some(Slot::A), snapshot: SnapshotState::Snapshotted, ..info() };
         let mut app = App::new(Screen::Home, W, SNUG, PPD);
         let fr = app.frame(&f, &i);
         let reboot = fr.hits.iter().find(|h| h.action == Action::Open(Screen::Reboot)).expect("a reboot row").rect;
@@ -7411,9 +7688,7 @@ mod tests {
         // The bar's top along a column through it, clear of the title and
         // the placeholder: the first row in the field's grey.
         let x = m.dp(300.0) as u32;
-        let top = |screen: &Canvas| {
-            (m.dp(40.0) as u32..H).find(|&y| screen.data[((y * W + x) * 4) as usize] == t.pal.search.r).map(|y| y as f32)
-        };
+        let top = |screen: &Canvas| (m.dp(40.0) as u32..H).find(|&y| screen.data[((y * W + x) * 4) as usize] == t.pal.search.r).map(|y| y as f32);
         let grey = |screen: &Canvas, y: f32| screen.data[((y as u32 * W + W / 2) * 4) as usize];
         let (home, field) = (m.content_top, widgets::search_layout(&t).0.y);
         // The device card under the home page's bar.
@@ -7885,6 +8160,7 @@ mod tests {
     #[test]
     fn the_home_pages_word_on_a_waiting_update_opens_its_page() {
         let (f, mut i) = (fonts(), info());
+        i.slot = Some(Slot::A);
         i.snapshot = SnapshotState::Snapshotted;
         let mut app = App::new(Screen::Home, W, H, PPD);
         assert_eq!(tap(&mut app, &f, &i, Action::Open(Screen::Update)), vec![Effect::ReadUpdate]);
@@ -8139,12 +8415,7 @@ mod tests {
             quick: false,
             plugged: false,
         };
-        let i = DeviceInfo {
-            os_version: Some("OS3.0.305.0.WMACNXM".into()),
-            android: Some("16".into()),
-            battery: Some(battery),
-            ..info()
-        };
+        let i = DeviceInfo { os_version: Some("OS3.0.305.0.WMACNXM".into()), android: Some("16".into()), battery: Some(battery), ..info() };
         let mut app = App::new(Screen::Specs, W, H, PPD);
         app.frame(&f, &i);
         let lift = flick(&mut app, &f, 1000, 20.0);
@@ -8544,7 +8815,10 @@ mod tests {
 
     #[test]
     fn an_image_goes_where_it_is_sent_once_swiped() {
-        let (f, i) = (fonts(), info());
+        // The slot to write is asked of a phone that keeps a set of
+        // partitions per slot.
+        let (f, mut i) = (fonts(), info());
+        i.slot = Some(Slot::A);
         let mut app = sideloading(&f, &i);
         app.install(Event::Checking { size: 201_326_592 }, 0);
         let kind = ImageKind::Boot { kernel: true, ramdisk: skyward_install::Ramdisk::Recovery };
@@ -8563,7 +8837,13 @@ mod tests {
         assert_eq!(app.state.install, Install::Flashing { partition: "boot", stage: Some(Stage::Flashing { done: 10, total: 40 }) });
         app.key(Key::Back, 1000);
         assert_eq!(app.screen(), Screen::Installing, "a partition being written keeps the page");
-        app.install(Event::Finished(Outcome::Flashed { partition: "boot", slots: vec![Slot::A, Slot::B] }), 1000);
+        app.install(
+            Event::Finished(Outcome::Flashed {
+                partition: "boot",
+                devices: vec![std::path::PathBuf::from("/dev/block/by-name/boot_a"), std::path::PathBuf::from("/dev/block/by-name/boot_b")],
+            }),
+            1000,
+        );
         assert!(matches!(app.state.install, Install::Finished { damage: None, .. }), "a flash that worked broke nothing");
         assert_eq!(tap_at(&mut app, &f, &i, Action::RebootTo(Target::System), 2000), vec![Effect::Reboot(Target::System)]);
         app.key(Key::Back, 2000);
@@ -8655,7 +8935,7 @@ mod tests {
     #[test]
     fn the_keys_reach_the_last_row_of_a_home_page_grown_by_an_update_notice() {
         let f = fonts();
-        let i = DeviceInfo { snapshot: SnapshotState::Snapshotted, ..info() };
+        let i = DeviceInfo { slot: Some(Slot::A), snapshot: SnapshotState::Snapshotted, ..info() };
         let mut app = App::new(Screen::Home, W, SNUG, PPD);
         let (_, y) = spot(&mut app, &f, &i, Action::Open(Screen::Reboot));
         assert!(y > SNUG as f32, "below the screen to start with");
@@ -8904,7 +9184,7 @@ mod tests {
         press(&mut app, Key::VolumeDown, 0);
         assert!(press(&mut app, Key::Power, 0).is_empty(), "a dot joined already is not joined again");
         press(&mut app, Key::VolumeUp, 0);
-        assert_eq!(press(&mut app, Key::Power, 0), vec![Effect::Unlock { user: 0, code: "1236987".into() }], "the last one joined ends it");
+        assert_eq!(press(&mut app, Key::Power, 0), vec![Effect::Unlock { user: 0, code: b"1236987".to_vec() }], "the last one joined ends it");
     }
 
     #[test]
@@ -8919,7 +9199,7 @@ mod tests {
         }
         assert_eq!(app.state.code, "2580");
         light_on(&mut app, &f, &i, Stop::Hit(Action::Type(Cap::Enter)));
-        assert_eq!(press(&mut app, Key::Power, 0), vec![Effect::Unlock { user: 0, code: "2580".into() }]);
+        assert_eq!(press(&mut app, Key::Power, 0), vec![Effect::Unlock { user: 0, code: b"2580".to_vec() }]);
     }
 
     #[test]
@@ -9083,6 +9363,33 @@ mod tests {
         assert!(chosen(&app).is_empty(), "tapped again, a part is left out");
         tap(&mut app, &f, &i, Action::WipeItem(Wipe::All));
         assert_eq!(swipe(&mut app, &f, &i, Confirm::Wipe), vec![Effect::Wipe(vec![Wipe::All])]);
+    }
+
+    #[test]
+    fn the_wipe_page_makes_any_number_of_partitions_afresh_at_once() {
+        let (f, i) = (fonts(), info());
+        let mut app = opened(Screen::Wipe, &f, &i);
+        app.state.formats = vec![Part::Data, Part::Cache, Part::Metadata, Part::System, Part::Vendor];
+        app.refresh();
+        let ticked = |app: &App| app.state.format.clone();
+        assert!(swipe(&mut app, &f, &i, Confirm::Wipe).is_empty(), "nothing is ticked at first");
+        tap(&mut app, &f, &i, Action::Format(Part::Vendor));
+        assert_eq!(ticked(&app), [Part::Vendor], "a row ticked on its own");
+        tap(&mut app, &f, &i, Action::Format(Part::System));
+        tap(&mut app, &f, &i, Action::Format(Part::Cache));
+        assert_eq!(ticked(&app), [Part::Cache, Part::System, Part::Vendor], "any number of rows may be ticked, and one swipe takes them all");
+        assert_eq!(
+            swipe(&mut app, &f, &i, Confirm::Format),
+            vec![Effect::Format(vec![Part::Cache, Part::System, Part::Vendor])],
+            "each of them is made afresh, in the order the page lists them"
+        );
+        tap(&mut app, &f, &i, Action::Format(Part::System));
+        assert_eq!(ticked(&app), [Part::Cache, Part::Vendor], "tapped again, a row is left out");
+        tap(&mut app, &f, &i, Action::WipeItem(Wipe::Media));
+        assert!(ticked(&app).is_empty(), "choosing what to wipe leaves the partitions out");
+        tap(&mut app, &f, &i, Action::Format(Part::Data));
+        assert!(app.state.wipe.iter().all(|on| !on), "and ticking a partition leaves what was to be wiped out");
+        assert_eq!(swipe(&mut app, &f, &i, Confirm::Format), vec![Effect::Format(vec![Part::Data])]);
     }
 
     #[test]
@@ -9255,14 +9562,23 @@ mod tests {
     fn the_install_page_offers_to_keep_skyward_where_the_phone_has_recovery_partitions() {
         let (f, i) = (fonts(), info());
         let mut app = opened(Screen::Install, &f, &i);
-        let offered = |app: &mut App| app.frame(&f, &i).hits.iter().any(|h| h.action == Action::Toggle(Switch::KeepRecovery));
-        assert!(!offered(&mut app), "a phone whose recovery lives in boot");
+        let offered = |app: &mut App, i: &DeviceInfo| app.frame(&f, i).hits.iter().any(|h| h.action == Action::Toggle(Switch::KeepRecovery));
+        assert!(!offered(&mut app, &i), "a phone whose recovery lives in boot");
         app.state.recovery_partitions = true;
         app.refresh();
-        assert!(offered(&mut app));
-        assert!(app.state.keep_recovery, "on until turned off");
-        tap(&mut app, &f, &i, Action::Toggle(Switch::KeepRecovery));
-        assert!(!app.state.keep_recovery);
+        assert!(!offered(&mut app, &i), "a phone with one set of partitions has no other recovery to come back to");
+        // A phone that keeps a set of partitions per slot is asked of its
+        // own app: a frame is only drawn again when there is something to
+        // draw, and the same page asked of another phone would answer with
+        // the frame it drew last.
+        let two = DeviceInfo { slot: Some(Slot::A), ..i.clone() };
+        let mut both = opened(Screen::Install, &f, &two);
+        both.state.recovery_partitions = true;
+        both.refresh();
+        assert!(offered(&mut both, &two), "and one per slot is kept");
+        assert!(both.state.keep_recovery, "on until turned off");
+        tap(&mut both, &f, &two, Action::Toggle(Switch::KeepRecovery));
+        assert!(!both.state.keep_recovery);
     }
 
     #[test]
@@ -9400,24 +9716,26 @@ mod tests {
     fn a_backup_takes_what_is_ticked_to_where_it_is_sent() {
         let (f, i) = (fonts(), info());
         let mut app = opened(Screen::Backup, &f, &i);
-        assert_eq!(app.state.backup, [true, true, false, true]);
+        // What the phone's own table and boot partitions say to offer.
+        app.set_backup_of(HELD.iter().map(|name| (name.to_string(), format!("/dev/block/by-name/{name}"))).collect());
+        assert_eq!(BackupChoice::chosen(&app.state.backup), ticked(&["boot", "system", "modem"]), "everything but the data partition's files");
         assert!(swipe(&mut app, &f, &i, Confirm::Backup).is_empty(), "internal storage waits for the data partition");
         assert_eq!(app.deadline(0), Some(TOAST_MS), "and says so");
         // The owner's files open first; another user's still wait.
         app.data_waiting(Some((10, Keys::Digits)));
-        let first = Effect::Backup { parts: [true, true, false, true], place: Place::Storage, compress: false, verify: true };
+        let first = Effect::Backup { parts: ticked(&["boot", "system", "modem"]), place: Place::Storage, compress: false, verify: true };
         assert_eq!(swipe(&mut app, &f, &i, Confirm::Backup), vec![first]);
         tap(&mut app, &f, &i, Action::BackupPart(2));
         assert!(swipe(&mut app, &f, &i, Confirm::Backup).is_empty(), "the data partition is backed up only with every user's files open");
         app.data_waiting(None);
         tap(&mut app, &f, &i, Action::BackupPart(0));
-        assert_eq!(app.state.backup, [false, true, true, true]);
+        assert_eq!(BackupChoice::chosen(&app.state.backup), ticked(&["system", "data", "modem"]));
         tap(&mut app, &f, &i, Action::BackupTo(Place::UsbDrive));
         tap(&mut app, &f, &i, Action::Toggle(Switch::Compress));
         tap(&mut app, &f, &i, Action::Toggle(Switch::Verify));
         assert!(swipe(&mut app, &f, &i, Confirm::Backup).is_empty(), "no drive is plugged in");
         app.set_usb_drive(Some(UsbDrive::Shown));
-        let second = Effect::Backup { parts: [false, true, true, true], place: Place::UsbDrive, compress: true, verify: false };
+        let second = Effect::Backup { parts: ticked(&["system", "data", "modem"]), place: Place::UsbDrive, compress: true, verify: false };
         assert_eq!(swipe(&mut app, &f, &i, Confirm::Backup), vec![second]);
         for k in 1..4 {
             tap(&mut app, &f, &i, Action::BackupPart(k));
@@ -9425,12 +9743,21 @@ mod tests {
         assert!(swipe(&mut app, &f, &i, Confirm::Backup).is_empty(), "nothing ticked, nothing backed up");
     }
 
-    /// A backup found in `place`, made at `made`, holding `parts`.
-    fn found(place: Place, made: i64, parts: [bool; 4]) -> BackupEntry {
+    /// The partitions a sample backup is taken to hold.
+    const HELD: [&str; 4] = ["boot", "system", "data", "modem"];
+
+    /// The names of a list, as an effect carries the ones ticked.
+    fn ticked(names: &[&str]) -> Vec<String> {
+        names.iter().map(|name| name.to_string()).collect()
+    }
+
+    /// A backup found in `place`, made at `made`, holding the partitions
+    /// named.
+    fn found(place: Place, made: i64, names: &[&str]) -> BackupEntry {
         let held = Held {
             made,
             size: 6_200_000_000,
-            parts,
+            names: names.iter().map(|name| name.to_string()).collect(),
             device: "ishtar".into(),
             system: Some("OS3.0.305.0.WMACNXM".into()),
             slot: Some(Slot::B),
@@ -9444,7 +9771,7 @@ mod tests {
         let mut app = App::new(Screen::Home, W, H, PPD);
         assert_eq!(tap(&mut app, &f, &i, Action::Open(Screen::Restore)), vec![Effect::FindBackups { storage: false, usb: false }]);
         let unread = BackupEntry { place: Place::Storage, name: "20261021-150000".into(), held: Err("read backup.toml: not found".into()) };
-        let (old, new) = (found(Place::UsbDrive, 1_792_000_000, [true; 4]), found(Place::Storage, 1_792_348_260, [true; 4]));
+        let (old, new) = (found(Place::UsbDrive, 1_792_000_000, &HELD), found(Place::Storage, 1_792_348_260, &HELD));
         app.set_backups(vec![unread.clone(), old.clone(), new.clone()]);
         assert_eq!(app.state.backups, [new, old, unread]);
         let opens = app.frame(&f, &i).hits.iter().filter(|h| matches!(h.action, Action::OpenBackup(_))).count();
@@ -9456,21 +9783,20 @@ mod tests {
         let (f, i) = (fonts(), info());
         let mut app = opened(Screen::Restore, &f, &i);
         assert!(app.frame(&f, &i).hits.is_empty(), "nothing found, nothing to open");
-        app.set_backups(vec![found(Place::Storage, 1_792_348_260, [true, true, false, true])]);
+        app.set_backups(vec![found(Place::Storage, 1_792_348_260, &["boot", "system", "modem"])]);
         tap(&mut app, &f, &i, Action::OpenBackup(0));
         assert_eq!(app.screen(), Screen::RestoreBackup);
-        let parts: Vec<Action> =
-            app.frame(&f, &i).hits.iter().map(|h| h.action).filter(|a| matches!(a, Action::RestorePart(_))).collect();
-        assert_eq!(parts, [Action::RestorePart(0), Action::RestorePart(1), Action::RestorePart(3)], "only what the backup holds");
+        let parts: Vec<Action> = app.frame(&f, &i).hits.iter().map(|h| h.action).filter(|a| matches!(a, Action::RestorePart(_))).collect();
+        assert_eq!(parts, [Action::RestorePart(0), Action::RestorePart(1), Action::RestorePart(2)], "only what the backup holds");
         tap(&mut app, &f, &i, Action::RestorePart(1));
-        assert_eq!(app.state.restore.as_ref().map(|r| r.1), Some([true, false, false, true]));
+        let opened = app.state.restore.as_ref().expect("the page of a backup opened");
+        assert_eq!(BackupChoice::chosen(&opened.1), ticked(&["boot", "modem"]));
         let name = fmt::stamp(1_792_348_260, 0);
-        assert_eq!(swipe(&mut app, &f, &i, Confirm::Restore), vec![Effect::Restore {
-            place: Place::Storage,
-            name: name.clone(),
-            parts: [true, false, false, true]
-        }]);
-        for k in [0, 3] {
+        assert_eq!(
+            swipe(&mut app, &f, &i, Confirm::Restore),
+            vec![Effect::Restore { place: Place::Storage, name: name.clone(), parts: ticked(&["boot", "modem"]) }]
+        );
+        for k in [0, 2] {
             tap(&mut app, &f, &i, Action::RestorePart(k));
         }
         assert!(swipe(&mut app, &f, &i, Confirm::Restore).is_empty(), "nothing ticked, nothing restored");
@@ -9482,20 +9808,25 @@ mod tests {
     fn a_data_backup_is_restored_only_with_every_users_files_open() {
         let (f, i) = (fonts(), info());
         let mut app = opened(Screen::Restore, &f, &i);
-        app.set_backups(vec![found(Place::Storage, 1_792_348_260, [false, false, true, false])]);
+        app.set_backups(vec![found(Place::Storage, 1_792_348_260, &["data"])]);
         tap(&mut app, &f, &i, Action::OpenBackup(0));
         assert!(swipe(&mut app, &f, &i, Confirm::Restore).is_empty());
         assert_eq!(app.deadline(0), Some(TOAST_MS), "the page says to decrypt first");
         app.data_waiting(None);
         let fx = swipe(&mut app, &f, &i, Confirm::Restore);
-        assert!(matches!(&fx[..], [Effect::Restore { parts: [false, false, true, false], .. }]), "{fx:?}");
+        match &fx[..] {
+            [Effect::Restore { parts, .. }] => {
+                assert_eq!(*parts, ticked(&["data"]), "what the folder holds")
+            }
+            other => panic!("{other:?}"),
+        }
     }
 
     #[test]
     fn a_backup_made_on_another_phone_is_not_restored_here() {
         let (f, i) = (fonts(), info());
         let mut app = opened(Screen::Restore, &f, &i);
-        let mut other = found(Place::Storage, 1_792_348_260, [true; 4]);
+        let mut other = found(Place::Storage, 1_792_348_260, &HELD);
         other.held.as_mut().unwrap().device = "aurora".into();
         let unread = BackupEntry { place: Place::Storage, name: "20261021-150000".into(), held: Err("read backup.toml: not found".into()) };
         app.set_backups(vec![other, unread]);
@@ -9512,7 +9843,7 @@ mod tests {
         let (f, i) = (fonts(), info());
         let mut app = opened(Screen::Restore, &f, &i);
         app.data_waiting(None);
-        let entry = found(Place::Storage, 1_792_348_260, [true; 4]);
+        let entry = found(Place::Storage, 1_792_348_260, &HELD);
         app.set_backups(vec![entry.clone()]);
         tap(&mut app, &f, &i, Action::OpenBackup(0));
         assert!(app.frame(&f, &i).hits.iter().all(|h| h.action != Action::Confirm(Confirm::DeleteBackup)), "asked for first");
@@ -9530,7 +9861,7 @@ mod tests {
         let mut app = App::new(Screen::Home, W, H, PPD);
         app.set_usb_drive(Some(UsbDrive::Shown));
         assert_eq!(tap(&mut app, &f, &i, Action::Open(Screen::Restore)), vec![Effect::FindBackups { storage: false, usb: true }]);
-        app.set_backups(vec![found(Place::UsbDrive, 1_792_348_260, [true; 4])]);
+        app.set_backups(vec![found(Place::UsbDrive, 1_792_348_260, &HELD)]);
         tap(&mut app, &f, &i, Action::OpenBackup(0));
         assert_eq!(app.set_usb_drive(None), vec![Effect::FindBackups { storage: false, usb: false }]);
         assert_eq!((app.screen(), app.state.restore.clone()), (Screen::Restore, None));
@@ -9560,7 +9891,7 @@ mod tests {
     fn a_restore_checks_its_backup_first_and_goes_on_to_its_end_once_writing() {
         let (f, i) = (fonts(), info());
         let mut app = opened(Screen::Restore, &f, &i);
-        app.set_backups(vec![found(Place::Storage, 1_792_348_260, [true; 4])]);
+        app.set_backups(vec![found(Place::Storage, 1_792_348_260, &HELD)]);
         tap(&mut app, &f, &i, Action::OpenBackup(0));
         app.backup_started(true, Place::Storage, true);
         app.backup_plan(vec![("boot".into(), 200), ("data".into(), 800)]);
@@ -9792,7 +10123,7 @@ mod tests {
         tap(&mut app, &f, &i, Action::Type(Cap::Backspace));
         assert_eq!(app.state.code, "123");
         let fx = tap(&mut app, &f, &i, Action::Type(Cap::Enter));
-        assert_eq!(fx, vec![Effect::Unlock { user: 0, code: "123".into() }]);
+        assert_eq!(fx, vec![Effect::Unlock { user: 0, code: b"123".to_vec() }]);
         assert_eq!(app.state.code, "", "what was typed is gone once it is sent");
         assert_eq!(app.state.data, Data::Locked { user: 0, keys: Keys::Digits, checking: true });
         assert!(!keys_shown(&mut app, &f, &i), "nothing more is taken while it is checked");
@@ -9825,7 +10156,7 @@ mod tests {
             app.touch(Touch::Move(dots[which].0, dots[which].1 - scroll), &f, 0);
         }
         let fx = app.touch(Touch::Up, &f, 0);
-        assert_eq!(fx, vec![Effect::Unlock { user: 0, code: "1258".into() }], "the dots counted from one across the rows");
+        assert_eq!(fx, vec![Effect::Unlock { user: 0, code: b"1258".to_vec() }], "the digits the dots are drawn on, in the order joined");
         assert!(app.state.pattern.is_empty(), "the grid is cleared once it is sent");
         assert!(app.frame(&f, &i).hits.iter().all(|h| h.action != Action::Pattern), "nothing more is drawn while it is checked");
     }
@@ -10542,10 +10873,7 @@ mod tests {
         assert!(reboot(&mut app), "refused, the user chooses where to go");
         let frame = app.frame(&f, &i);
         assert!(!frame.back);
-        assert!(
-            frame.hits.iter().any(|h| h.action == Action::EnterRecovery),
-            "the recovery, which ran without the slot's partitions, brings them up to go on"
-        );
+        assert!(frame.hits.iter().any(|h| h.action == Action::EnterRecovery), "the recovery, which ran without the slot's partitions, brings them up to go on");
     }
 
     #[test]
@@ -10650,7 +10978,11 @@ mod tests {
         type_in(&mut app, "12");
         let fx = tap(&mut app, &f, &i, Action::Type(Cap::Enter));
         let join = Effect::JoinWlan { ssid: b"Skyward".to_vec(), name: "Skyward".into(), security: Security::Psk, password: Secret("secret12".into()) };
-        assert_eq!(format!("{join:?}"), r#"JoinWlan { ssid: [83, 107, 121, 119, 97, 114, 100], name: "Skyward", security: Psk, password: Secret(8 characters) }"#, "what is printed leaves the password out");
+        assert_eq!(
+            format!("{join:?}"),
+            r#"JoinWlan { ssid: [83, 107, 121, 119, 97, 114, 100], name: "Skyward", security: Psk, password: Secret(8 characters) }"#,
+            "what is printed leaves the password out"
+        );
         assert_eq!(fx, vec![join]);
         assert_eq!(app.screen(), Screen::Wlan, "the WLAN page shows how joining goes");
         assert_eq!((app.state.password.as_str(), app.state.joining.as_ref()), ("", None), "the password is not kept");
@@ -11038,8 +11370,7 @@ mod tests {
         let mut app = in_sdcard(&f, &i);
         hold_entry(&mut app, &f, &i, 1);
         tap(&mut app, &f, &i, Action::RenameEntry);
-        let refused =
-            [("", "请输入名称"), ("..", "名称不能为\".\"或\"..\""), ("x/y", "名称不能包含\"/\""), ("DCIM", "该文件夹中已有\"DCIM\"")];
+        let refused = [("", "请输入名称"), ("..", "名称不能为\".\"或\"..\""), ("x/y", "名称不能包含\"/\""), ("DCIM", "该文件夹中已有\"DCIM\"")];
         for (name, said) in refused {
             app.state.new_name = name.into();
             app.toast = None;
@@ -11561,10 +11892,7 @@ mod tests {
         assert!(tap_at(&mut app, &f, &i, Action::RebootTo(Target::System), 200).is_empty());
         assert_eq!(app.screen(), Screen::Installing, "the stray tap did not reboot");
         // Past the guard the same tap reboots.
-        assert_eq!(
-            tap_at(&mut app, &f, &i, Action::RebootTo(Target::System), 700),
-            vec![Effect::Reboot(Target::System)]
-        );
+        assert_eq!(tap_at(&mut app, &f, &i, Action::RebootTo(Target::System), 700), vec![Effect::Reboot(Target::System)]);
     }
 
     #[test]
@@ -11609,7 +11937,7 @@ mod tests {
         press(&mut app, Key::Power, 500);
         app.install(Event::Progress(Stage::Flashing { done: 1, total: 2 }), 510);
         assert!(!app.display_on(), "progress does not");
-        app.install(Event::Finished(Outcome::Flashed { partition: "dtbo", slots: vec![Slot::A] }), 520);
+        app.install(Event::Finished(Outcome::Flashed { partition: "dtbo", devices: vec![std::path::PathBuf::from("/dev/block/by-name/dtbo_a")] }), 520);
         assert!(app.display_on(), "the end does");
     }
 

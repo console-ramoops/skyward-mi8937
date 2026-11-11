@@ -2245,6 +2245,7 @@ dependencies = [
  "evdev",
  "libc",
  "procfs",
+ "sha2 0.10.9",
  "skyward-backup",
  "skyward-binder",
  "skyward-block",
@@ -2298,6 +2299,8 @@ dependencies = [
  "libc",
  "procfs",
  "serde",
+ "skyward-lp",
+ "tempfile",
  "zerocopy",
 ]
 
@@ -2308,7 +2311,9 @@ dependencies = [
  "abootimg-oxide",
  "anyhow",
  "cpio",
+ "flate2",
  "libc",
+ "liblzma",
  "lz4_flex",
  "tempfile",
 ]
@@ -2369,6 +2374,7 @@ dependencies = [
  "cpio",
  "flate2",
  "libc",
+ "liblzma",
  "lz4_flex",
  "p256",
  "polyfuse-kernel",
@@ -2443,6 +2449,7 @@ dependencies = [
 name = "skyward-pack"
 version = "0.2.0"
 dependencies = [
+ "abootimg-oxide",
  "anyhow",
  "clap",
  "serde_json",

@@ -8,6 +8,7 @@ pub mod dm;
 pub mod erase;
 pub mod fsck;
 pub mod fstab;
+pub mod logical;
 pub mod loopdev;
 pub mod mount;
 pub mod probe;
@@ -89,12 +90,9 @@ pub fn size_bytes(path: impl AsRef<Path>) -> Result<u64> {
     // _IOR(0x12, 114, size_t) on aarch64 Linux. bionic's ioctl request arg is
     // a c_int, so the request is reinterpreted into it rather than widened.
     const BLKGETSIZE64: u32 = 0x8008_1272;
-    let f = fs::File::open(path.as_ref())
-        .with_context(|| format!("open {}", path.as_ref().display()))?;
+    let f = fs::File::open(path.as_ref()).with_context(|| format!("open {}", path.as_ref().display()))?;
     let mut size: u64 = 0;
-    let rc = unsafe {
-        libc::ioctl(f.as_raw_fd(), BLKGETSIZE64 as libc::c_int, &mut size as *mut u64)
-    };
+    let rc = unsafe { libc::ioctl(f.as_raw_fd(), BLKGETSIZE64 as libc::c_int, &mut size as *mut u64) };
     if rc != 0 {
         return Err(std::io::Error::last_os_error()).context("BLKGETSIZE64");
     }

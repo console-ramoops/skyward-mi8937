@@ -10,10 +10,9 @@ use skyward_net::supplicant::Security;
 use skyward_net::wlan::{Bands, Joined, Link, Network, Power, Stage as Joining, Traffic, Wlan};
 use skyward_systems::{Named, Other, Overview, Who};
 use skyward_ui::app::{
-    Action, Adding, App, Asked, BackupAt, BackupEnd, BackupEntry, BackupJob, BackupRefusal, Choice, Clip, Damage, Data, DownloadEnd,
-    DownloadJob, EraseStop, Field, FileKind, FileOp, FileRow, FileTask, FsAction, FsRow, Have, Held, Install, ItemEnd, JobEnd, Key, Keys,
-    MountFailure, MountRow, Part, PartKind, PartStop, Pick, Place, Screen, SkywardEnd, SkywardJob, SkywardStage, Source, SystemChoice,
-    SystemsWork, TermEnd, Touch, UsbDrive, UsbLink, SCREEN_OFF,
+    Action, Adding, App, Asked, BackupAt, BackupChoice, BackupEnd, BackupEntry, BackupJob, BackupRefusal, Choice, Clip, Damage, Data, DownloadEnd, DownloadJob,
+    EraseStop, Field, FileKind, FileOp, FileRow, FileTask, FsAction, FsRow, Have, Held, Install, ItemEnd, JobEnd, Key, Keys, MountFailure, MountRow, Part,
+    PartKind, PartStop, Pick, Place, Screen, SkywardEnd, SkywardJob, SkywardStage, Source, SystemChoice, TermEnd, Touch, UsbDrive, UsbLink, SCREEN_OFF,
 };
 use skyward_ui::widgets::{self, Bar, Bolt, Cap, Layer};
 use skyward_ui::{editor, fmt, pages, Canvas, Ctx, Fonts, Lang, Theme};
@@ -91,13 +90,7 @@ Done: 38.204116 secs\n";
 /// partition open or closed.
 fn phone_filesystems(open: bool) -> Vec<FsRow> {
     vec![
-        FsRow {
-            name: "data".into(),
-            mount_point: "/data".into(),
-            filesystem: open.then(|| "f2fs".into()),
-            size: 237_498_597_376,
-            others: Vec::new(),
-        },
+        FsRow { name: "data".into(), mount_point: "/data".into(), filesystem: open.then(|| "f2fs".into()), size: 237_498_597_376, others: Vec::new() },
         FsRow { name: "metadata".into(), mount_point: "/metadata".into(), filesystem: Some("f2fs".into()), size: 64 << 20, others: Vec::new() },
     ]
 }
@@ -123,6 +116,10 @@ type MountShot<'a> = (&'a str, bool, &'a DeviceInfo, Option<MountFailure>, &'a [
 
 /// File name, page, dark theme, and what to set before the page is drawn.
 type PageShot<'a> = (&'a str, Screen, bool, &'a dyn Fn(&mut App));
+
+/// The partitions a phone whose table has every one of them offers to make
+/// afresh, in the order the wipe page lists them.
+const ALL_FORMATS: [Part; 5] = [Part::Data, Part::Cache, Part::Metadata, Part::System, Part::Vendor];
 
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
@@ -204,11 +201,7 @@ fn main() -> Result<()> {
     let installing: [(&str, bool, Install); 17] = [
         ("30-sideload-waiting", false, Install::Waiting),
         ("31-sideload-checking", false, Install::Checking { size: 7_103_043_868, stage: None }),
-        (
-            "31-sideload-verifying-dark",
-            true,
-            Install::Checking { size: 25_166_592, stage: Some(Stage::Signature { done: 10_485_760, total: 25_164_934 }) },
-        ),
+        ("31-sideload-verifying-dark", true, Install::Checking { size: 25_166_592, stage: Some(Stage::Signature { done: 10_485_760, total: 25_164_934 }) }),
         (
             "32-sideload-choosing",
             false,
@@ -239,18 +232,16 @@ fn main() -> Result<()> {
         (
             "37-sideload-flashed-recovery-dark",
             true,
-            Install::Finished { outcome: Outcome::Flashed { partition: "recovery", slots: vec![Slot::A, Slot::B] }, damage: None },
+            Install::Finished {
+                outcome: Outcome::Flashed {
+                    partition: "recovery",
+                    devices: ["/dev/block/by-name/recovery_a", "/dev/block/by-name/recovery_b"].iter().map(PathBuf::from).collect(),
+                },
+                damage: None,
+            },
         ),
-        (
-            "38-sideload-refused",
-            false,
-            Install::Finished { outcome: Outcome::Refused(Refusal::OtherDevice("ishtar".into())), damage: None },
-        ),
-        (
-            "39-sideload-failed",
-            false,
-            Install::Finished { outcome: Outcome::Failed(Failure::Engine(9)), damage: Some(Damage::System) },
-        ),
+        ("38-sideload-refused", false, Install::Finished { outcome: Outcome::Refused(Refusal::OtherDevice("ishtar".into())), damage: None }),
+        ("39-sideload-failed", false, Install::Finished { outcome: Outcome::Failed(Failure::Engine(9)), damage: Some(Damage::System) }),
         (
             "40-sideload-error-dark",
             true,
@@ -287,11 +278,7 @@ fn main() -> Result<()> {
 
     // The mount page as it opens after boot, after an unmount that failed,
     // and while an update waits to merge, with some partitions unmounted.
-    let busy = MountFailure {
-        mounting: false,
-        base: "vendor".into(),
-        detail: "unmount /vendor: Device or resource busy (os error 16)".into(),
-    };
+    let busy = MountFailure { mounting: false, base: "vendor".into(), detail: "unmount /vendor: Device or resource busy (os error 16)".into() };
     let mounting: [MountShot; 3] = [
         ("15-mount-light", false, &info, None, &[]),
         ("16-mount-dark-unmount-failed", true, &info, Some(busy), &[]),
@@ -310,19 +297,58 @@ fn main() -> Result<()> {
     }
 
     // The pages the remaining features open, each with what it would show.
-    let made = |place, made, size, parts, system: &str| {
-        let held = Held { made, size, parts, device: cfg.device.codename.clone(), system: Some(system.into()), slot: Some(Slot::B) };
+    let made = |place, made, size, names: &[&str], system: &str| {
+        let held = Held {
+            made,
+            size,
+            names: names.iter().map(|name| name.to_string()).collect(),
+            device: cfg.device.codename.clone(),
+            system: Some(system.into()),
+            slot: Some(Slot::B),
+        };
         BackupEntry { place, name: fmt::stamp(made, 0), held: Ok(held) }
     };
     let backups = vec![
-        made(Place::Storage, 1_792_348_260, 6_214_000_000, [true, true, false, true], "OS4.0.4.0.XPACNXM"),
-        made(Place::UsbDrive, 1_791_830_000, 141_000_000, [true, false, false, false], "OS4.0.3.0.XPACNXM"),
+        made(Place::Storage, 1_792_348_260, 6_214_000_000, &["boot", "recovery", "system", "cust", "persist", "modem", "data"], "OS4.0.4.0.XPACNXM"),
+        made(Place::UsbDrive, 1_791_830_000, 141_000_000, &["boot", "recovery"], "OS4.0.3.0.XPACNXM"),
         BackupEntry {
             place: Place::Storage,
             name: "20261020-221500".into(),
             held: Err("read /sdcard/Skyward/backups/20261020-221500/backup.toml: No such file or directory (os error 2)".into()),
         },
     ];
+    // The rows a backup page is offered, as the phone's own table would give
+    // them: the partition's name and where it is read from.
+    let backup_rows = || -> Vec<(String, String)> {
+        [
+            ("boot", "/dev/block/by-name/boot"),
+            ("recovery", "/dev/block/by-name/recovery"),
+            ("system", "/system_root"),
+            ("cust", "/vendor"),
+            ("cache", "/cache"),
+            ("persist", "/persist"),
+            ("modem", "/vendor/firmware_mnt"),
+            ("data", "/data"),
+            ("modemst1", "/dev/block/by-name/modemst1"),
+            ("modemst2", "/dev/block/by-name/modemst2"),
+            ("fsg", "/dev/block/by-name/fsg"),
+            ("fsc", "/dev/block/by-name/fsc"),
+        ]
+        .map(|(name, hint)| (name.to_string(), hint.to_string()))
+        .to_vec()
+    };
+    // What the page of one backup ticks: every name it holds, those in `on`
+    // with the box checked.
+    let ticked = |entry: &BackupEntry, on: &[&str]| -> Vec<BackupChoice> {
+        entry
+            .held
+            .as_ref()
+            .expect("a backup whose folder is read")
+            .names
+            .iter()
+            .map(|name| BackupChoice { name: name.clone(), hint: String::new(), on: on.contains(&name.as_str()) })
+            .collect()
+    };
     // What a backup of the slot's partitions and the baseband goes through.
     let plan = || -> Vec<(String, u64)> {
         [
@@ -349,9 +375,8 @@ fn main() -> Result<()> {
         .map(|(name, size)| (name.to_string(), size))
         .to_vec()
     };
-    let job = |restore, plan: Vec<(String, u64)>, at, outcome| {
-        Some(BackupJob { restore, place: Place::Storage, checks: true, plan, at, outcome, stopping: false })
-    };
+    let job =
+        |restore, plan: Vec<(String, u64)>, at, outcome| Some(BackupJob { restore, place: Place::Storage, checks: true, plan, at, outcome, stopping: false });
     let reset_asked = || Asked { reason: Some("factroy_reset(1217)".into()), ..Asked::default() };
     let in_download = |app: &mut App, name: &str| {
         app.set_files("/sdcard/Download".into(), Ok(sample_download()), LISTED);
@@ -423,9 +448,7 @@ fn main() -> Result<()> {
         ("19-choose-storage-dark-empty", Screen::Choose(Place::Storage), true, &|app| {
             app.set_place(Place::Storage, "Download/Skyward".into(), Ok(vec![file("notes.txt", 2_048, LISTED - 600)]), LISTED)
         }),
-        ("20-install-storage-checking", Screen::Installing, false, &|app| {
-            from_storage(app, Install::Checking { size: 7_014_220_000, stage: None })
-        }),
+        ("20-install-storage-checking", Screen::Installing, false, &|app| from_storage(app, Install::Checking { size: 7_014_220_000, stage: None })),
         ("20-install-storage-writing-dark", Screen::Installing, true, &|app| {
             let stage = Some(Stage::Writing { done: 2_934_000_000, total: 7_014_220_000 });
             from_storage(app, Install::Updating { version: Some("OS3.0.305.0.WMACNXM".into()), stage, overwriting: false })
@@ -489,25 +512,26 @@ fn main() -> Result<()> {
         ("41-search-light", Screen::Search, false, &|_| {}),
         ("42-search-light-found", Screen::Search, false, &|app| app.state.search = "b".into()),
         ("43-search-dark-pinyin", Screen::Search, true, &|app| app.state.search = "zd".into()),
-        ("44-backup-light", Screen::Backup, false, &|_| {}),
+        ("44-backup-light", Screen::Backup, false, &|app| app.set_backup_of(backup_rows())),
         ("45-backup-dark", Screen::Backup, true, &|app| {
             app.set_usb_drive(Some(UsbDrive::Shown));
             app.state.backup_to = Place::UsbDrive;
+            app.set_backup_of(backup_rows());
         }),
         ("46-restore-light-none", Screen::Restore, false, &|_| {}),
         ("47-restore-light", Screen::Restore, false, &|app| app.set_backups(backups.clone())),
         ("48-restore-backup-light", Screen::RestoreBackup, false, &|app| {
-            app.state.restore = Some((backups[0].clone(), [true, false, false, true]));
+            app.state.restore = Some((backups[0].clone(), ticked(&backups[0], &["boot", "modem"])));
         }),
         ("48-restore-backup-dark-deleting", Screen::RestoreBackup, true, &|app| {
-            app.state.restore = Some((backups[0].clone(), [true, true, false, true]));
+            app.state.restore = Some((backups[0].clone(), ticked(&backups[0], &["boot", "system", "modem"])));
             app.state.asking_delete = true;
         }),
         ("48-restore-backup-light-other-version", Screen::RestoreBackup, false, &|app| {
-            app.state.restore = Some((backups[1].clone(), [true, false, false, false]));
+            app.state.restore = Some((backups[1].clone(), ticked(&backups[1], &["boot"])));
         }),
         ("48-restore-backup-light-unreadable", Screen::RestoreBackup, false, &|app| {
-            app.state.restore = Some((backups[2].clone(), [false; 4]));
+            app.state.restore = Some((backups[2].clone(), Vec::new()));
         }),
         ("100-backup-job-light-measuring", Screen::BackupJob, false, &|app| app.state.backup_job = job(false, Vec::new(), None, None)),
         ("101-backup-job-light", Screen::BackupJob, false, &|app| {
@@ -544,9 +568,7 @@ fn main() -> Result<()> {
         ("50-files-light", Screen::Files, false, &|app| app.set_files("/".into(), Ok(sample_root()), LISTED)),
         ("51-files-dark", Screen::Files, true, &|app| app.set_files("/".into(), Ok(sample_root()), LISTED)),
         ("52-file-info-light", Screen::FileInfo, false, &|app| app.state.file = sample_root().into_iter().find(|e| e.name == "init.environ.rc")),
-        ("52-file-permissions-dark", Screen::Permissions, true, &|app| {
-            app.state.file = sample_root().into_iter().find(|e| e.name == "init.environ.rc")
-        }),
+        ("52-file-permissions-dark", Screen::Permissions, true, &|app| app.state.file = sample_root().into_iter().find(|e| e.name == "init.environ.rc")),
         ("61-files-names-light", Screen::Files, false, &|app| app.set_files("/sdcard/Download".into(), Ok(sample_download()), LISTED)),
         ("110-files-types-light", Screen::Files, false, &|app| app.set_files("/sdcard/Download".into(), Ok(sample_types()), LISTED)),
         ("110-files-types-dark", Screen::Files, true, &|app| app.set_files("/sdcard/Download".into(), Ok(sample_types()), LISTED)),
@@ -886,10 +908,6 @@ fn main() -> Result<()> {
             app.state.asking_delete = true;
         }),
         ("202-systems-light-empty", Screen::Systems, false, &|app| app.set_systems(Ok(Overview { other: None, ..two_systems() }))),
-        ("202-systems-dark-switching", Screen::Systems, true, &|app| {
-            app.set_systems(Ok(two_systems()));
-            app.state.systems_work = Some(SystemsWork::Switching(Who::Other));
-        }),
         ("202-systems-light-stopped", Screen::Systems, false, &|app| {
             app.set_systems(Ok(Overview { other_starts: true, ..two_systems() }));
             app.state.system_notice = Some("the root holds no program /sbin/init to start".into());
@@ -921,9 +939,7 @@ fn main() -> Result<()> {
             app.erase_started(false, true, Vec::new());
             app.erase_ended(Err(EraseStop::NoCache), 0);
         }),
-        ("73-cant-start-light", Screen::CantStart, false, &|app| {
-            app.set_asked(Asked { reason: Some("RescueParty".into()), ..Asked::default() })
-        }),
+        ("73-cant-start-light", Screen::CantStart, false, &|app| app.set_asked(Asked { reason: Some("RescueParty".into()), ..Asked::default() })),
         ("74-unhandled-dark", Screen::Unhandled, true, &|app| {
             app.set_asked(Asked { unhandled: Some("--update_package=/data/ota_package/update.zip".into()), ..Asked::default() })
         }),
@@ -971,11 +987,20 @@ fn main() -> Result<()> {
         ("90-decrypt-dark-failed", Screen::Decrypt, true, &|app| {
             app.data_failed("android.hardware.security.keymint.IKeyMintDevice/default is not running".into())
         }),
-        ("91-wipe-light-all", Screen::Wipe, false, &|app| app.state.wipe[0] = true),
+        ("91-wipe-light-all", Screen::Wipe, false, &|app| {
+            app.state.formats = ALL_FORMATS.to_vec();
+            app.state.wipe[0] = true
+        }),
         ("92-wipe-dark-parts-cache", Screen::Wipe, true, &|app| {
             app.state.cache_partition = true;
+            app.state.metadata_partition = true;
+            app.state.formats = ALL_FORMATS.to_vec();
             app.state.phone_logs = 7;
             app.state.wipe = [false, false, true, true, true, false, true, false, true];
+        }),
+        ("92b-wipe-light-format-parts", Screen::Wipe, false, &|app| {
+            app.state.formats = ALL_FORMATS.to_vec();
+            app.state.format = vec![Part::Cache, Part::System, Part::Vendor];
         }),
         ("93-erase-light-media", Screen::Erase, false, &|app| {
             app.erase_started(false, false, vec![Part::Media, Part::AppCaches, Part::SystemCaches, Part::Logs]);
@@ -1367,22 +1392,169 @@ fn sample_types() -> Vec<FileRow> {
 /// stand for its commands, in the file manager's order.
 fn sample_bin() -> Vec<FileRow> {
     let programs = [
-        "abb", "am", "app_process32", "app_process64", "applypatch", "appops", "appwidget", "atrace", "audioserver", "auditctl",
-        "blkid", "bmgr", "bootanimation", "bootstat", "bpfloader", "bugreport", "bugreportz", "cameraserver", "cmd", "content",
-        "crash_dump32", "crash_dump64", "debuggerd", "device_config", "dmctl", "dpm", "dumpstate", "dumpsys", "e2fsck", "e2fsdroid",
-        "fsck.f2fs", "fsck_msdos", "gatekeeperd", "gpuservice", "hid", "idmap2", "ime", "incident", "incidentd", "init", "input",
-        "installd", "ip", "iptables", "keystore2", "lmkd", "locksettings", "logcat", "logd", "lpdump", "lshal", "make_f2fs",
-        "mediaserver", "mke2fs", "monkey", "netd", "odsign", "perfetto", "ping", "pm", "reboot", "resize2fs", "run-as",
-        "screencap", "screenrecord", "sdcard", "sensorservice", "service", "servicemanager", "settings", "sgdisk", "sh",
-        "simpleperf", "sm", "snapshotctl", "storaged", "surfaceflinger", "svc", "tombstoned", "toolbox", "toybox", "traced",
-        "tune2fs", "uiautomator", "uncrypt", "update_engine", "update_verifier", "vdc", "vold", "wificond", "wm",
+        "abb",
+        "am",
+        "app_process32",
+        "app_process64",
+        "applypatch",
+        "appops",
+        "appwidget",
+        "atrace",
+        "audioserver",
+        "auditctl",
+        "blkid",
+        "bmgr",
+        "bootanimation",
+        "bootstat",
+        "bpfloader",
+        "bugreport",
+        "bugreportz",
+        "cameraserver",
+        "cmd",
+        "content",
+        "crash_dump32",
+        "crash_dump64",
+        "debuggerd",
+        "device_config",
+        "dmctl",
+        "dpm",
+        "dumpstate",
+        "dumpsys",
+        "e2fsck",
+        "e2fsdroid",
+        "fsck.f2fs",
+        "fsck_msdos",
+        "gatekeeperd",
+        "gpuservice",
+        "hid",
+        "idmap2",
+        "ime",
+        "incident",
+        "incidentd",
+        "init",
+        "input",
+        "installd",
+        "ip",
+        "iptables",
+        "keystore2",
+        "lmkd",
+        "locksettings",
+        "logcat",
+        "logd",
+        "lpdump",
+        "lshal",
+        "make_f2fs",
+        "mediaserver",
+        "mke2fs",
+        "monkey",
+        "netd",
+        "odsign",
+        "perfetto",
+        "ping",
+        "pm",
+        "reboot",
+        "resize2fs",
+        "run-as",
+        "screencap",
+        "screenrecord",
+        "sdcard",
+        "sensorservice",
+        "service",
+        "servicemanager",
+        "settings",
+        "sgdisk",
+        "sh",
+        "simpleperf",
+        "sm",
+        "snapshotctl",
+        "storaged",
+        "surfaceflinger",
+        "svc",
+        "tombstoned",
+        "toolbox",
+        "toybox",
+        "traced",
+        "tune2fs",
+        "uiautomator",
+        "uncrypt",
+        "update_engine",
+        "update_verifier",
+        "vdc",
+        "vold",
+        "wificond",
+        "wm",
     ];
     let commands = [
-        "base64", "basename", "cat", "chcon", "chmod", "chown", "cmp", "cp", "cut", "date", "dd", "df", "diff", "dirname", "dmesg",
-        "du", "echo", "env", "expr", "find", "free", "getprop", "grep", "head", "hostname", "id", "ifconfig", "insmod", "kill",
-        "ln", "ls", "lsmod", "lsof", "md5sum", "mkdir", "mount", "mv", "netstat", "nohup", "pgrep", "pidof", "pkill", "printf",
-        "ps", "pwd", "readlink", "rm", "rmdir", "sed", "sendevent", "seq", "setprop", "sleep", "sort", "start", "stat", "stop",
-        "tail", "tar", "tee", "top", "touch", "tr", "umount", "uname", "uptime", "wc", "which", "xargs", "xxd",
+        "base64",
+        "basename",
+        "cat",
+        "chcon",
+        "chmod",
+        "chown",
+        "cmp",
+        "cp",
+        "cut",
+        "date",
+        "dd",
+        "df",
+        "diff",
+        "dirname",
+        "dmesg",
+        "du",
+        "echo",
+        "env",
+        "expr",
+        "find",
+        "free",
+        "getprop",
+        "grep",
+        "head",
+        "hostname",
+        "id",
+        "ifconfig",
+        "insmod",
+        "kill",
+        "ln",
+        "ls",
+        "lsmod",
+        "lsof",
+        "md5sum",
+        "mkdir",
+        "mount",
+        "mv",
+        "netstat",
+        "nohup",
+        "pgrep",
+        "pidof",
+        "pkill",
+        "printf",
+        "ps",
+        "pwd",
+        "readlink",
+        "rm",
+        "rmdir",
+        "sed",
+        "sendevent",
+        "seq",
+        "setprop",
+        "sleep",
+        "sort",
+        "start",
+        "stat",
+        "stop",
+        "tail",
+        "tar",
+        "tee",
+        "top",
+        "touch",
+        "tr",
+        "umount",
+        "uname",
+        "uptime",
+        "wc",
+        "which",
+        "xargs",
+        "xxd",
     ];
     let mut rows = vec![folder("hw", 34, RAMDISK_TIME)];
     let mut rest: Vec<FileRow> = programs

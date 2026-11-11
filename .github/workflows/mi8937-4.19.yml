@@ -1,0 +1,48 @@
+name: Build Mi-Thorium mi8937_4_19
+
+on:
+  workflow_dispatch:
+    inputs:
+      base_recovery_url:
+        description: HTTPS download URL of the Mi-Thorium 4.19 recovery image
+        required: true
+        type: string
+      base_recovery_sha256:
+        description: SHA-256 of that base image
+        required: true
+        default: fec32362b887b122c1af54b9c82ede89f98240e871b9c4c5cde61ad08cfc1239
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  recovery:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/setup
+      - name: Install the font subset tool
+        run: python3 -m pip install fonttools==4.68.0
+      - name: Download and verify the base recovery
+        env:
+          BASE_URL: ${{ inputs.base_recovery_url }}
+          BASE_SHA256: ${{ inputs.base_recovery_sha256 }}
+        run: |
+          mkdir -p target/base
+          curl --fail --location --proto '=https' --proto-redir '=https' "$BASE_URL" -o target/base/recovery.img
+          printf '%s  %s\n' "$BASE_SHA256" target/base/recovery.img | sha256sum --check
+      - name: Build and pack Skyward
+        run: tools/build-mi8937-4.19.sh target/base/recovery.img out/skyward-mi8937_4_19.img
+      - name: Create the download
+        working-directory: out
+        run: |
+          sha256sum skyward-mi8937_4_19.img > SHA256SUMS
+          zip -9 skyward-mi8937_4_19.zip skyward-mi8937_4_19.img
+      - uses: actions/upload-artifact@v7
+        with:
+          name: skyward-mi8937_4_19
+          path: |
+            out/skyward-mi8937_4_19.zip
+            out/SHA256SUMS
+          if-no-files-found: error

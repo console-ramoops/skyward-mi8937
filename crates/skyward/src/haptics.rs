@@ -5,7 +5,7 @@ use std::f32::consts::{FRAC_PI_2, TAU};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::os::fd::AsRawFd;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -59,17 +59,34 @@ const TICKS_REST: Duration = Duration::from_millis(40);
 /// the click is taken away. So each click is loaded as it is played, at the
 /// strength the slider gives, and taken away once it has played out.
 pub struct Haptics {
-    dev: File,
-    click: Click,
-    ticks: Click,
+    motor: Motor,
     strength: Strength,
-    /// The click playing, by its slot and its count, until it is taken
-    /// away; a click taken away early by the next is not taken away again.
-    playing: Arc<Mutex<Option<(i16, u64)>>>,
+    /// The click playing, by what takes it away and its count, until it is
+    /// taken away; a click taken away early by the next is not taken away
+    /// again.
+    playing: Arc<Mutex<Option<(Taking, u64)>>>,
     clicks: u64,
 }
 
-/// What a click is.
+/// What the motor is reached through.
+enum Motor {
+    /// The kernel's force-feedback events, on an input device that takes
+    /// periodic effects. The ticks are made where the motor's resonant
+    /// frequency is known; without it the click's own waveform plays for
+    /// the screen going off.
+    Events { dev: File, click: Click, ticks: Option<Click> },
+    /// A driver with a folder of its own that plays a timed drive: its
+    /// `duration` file takes how long the motor is driven for, in whole
+    /// milliseconds, and its `activate` file starts that drive, or stops it
+    /// when told 0. What it drives the motor at is a voltage of the driver's
+    /// own choosing, so the only thing a click's strength can reach here is
+    /// how long the drive lasts; the `brightness` file such a folder usually
+    /// carries does nothing at all, its driver's own setter being empty.
+    Timed { folder: PathBuf, drive: u32 },
+}
+
+/// What a click is, for a driver that plays waveforms or samples.
+#[derive(Clone)]
 enum Click {
     /// A waveform the driver keeps, by its number. The driver says how long
     /// it plays as it loads it.
@@ -79,25 +96,51 @@ enum Click {
     Samples { data: Vec<i8>, rate: u32 },
 }
 
+/// What takes a click away.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Taking {
+    /// An effect in a slot of the input device's.
+    Slot(i16),
+    /// A drive the driver stops when told to.
+    Drive,
+}
+
 impl Haptics {
-    /// The force-feedback device and the configured click. Loading a click
-    /// fills the driver's queue with what it plays, so the click is loaded
-    /// only as it is played.
+    /// The motor and the configured click. Loading a click fills a
+    /// force-feedback driver's queue with what it plays, so the click is
+    /// loaded only as it is played.
     pub fn open(cfg: &skyward_config::Haptics) -> Result<Haptics> {
-        let (path, dev) = motor()?;
-        let hz = resonance(&cfg.resonance)?;
-        let click = match cfg.click {
-            Some(id) => {
-                eprintln!("haptics {}: clicks with waveform {id}, ticks made for a motor swinging at {hz} Hz", path.display());
-                Click::Kept(id)
+        let motor = match (cfg.click, &cfg.resonance, &cfg.timed) {
+            (Some(id), file, _) => {
+                let (path, dev) = events()?;
+                let ticks = match file {
+                    Some(file) => {
+                        let hz = resonance(file)?;
+                        eprintln!("haptics {}: clicks with waveform {id}, ticks made for a motor swinging at {hz} Hz", path.display());
+                        Some(Click::Samples { data: ticks(hz), rate: TICKS_RATE })
+                    }
+                    None => {
+                        eprintln!("haptics {}: clicks with waveform {id}", path.display());
+                        None
+                    }
+                };
+                Motor::Events { dev, click: Click::Kept(id), ticks }
             }
-            None => {
+            (None, Some(file), _) => {
+                let (path, dev) = events()?;
+                let hz = resonance(file)?;
                 eprintln!("haptics {}: clicks and ticks made for a motor swinging at {hz} Hz", path.display());
-                Click::Samples { data: made(hz), rate: RATE }
+                Motor::Events { dev, click: Click::Samples { data: made(hz), rate: RATE }, ticks: Some(Click::Samples { data: ticks(hz), rate: TICKS_RATE }) }
             }
+            (None, None, Some(folder)) => {
+                let folder = PathBuf::from(folder);
+                ensure!(folder.is_dir(), "{} is no driver folder to write a click to", folder.display());
+                eprintln!("haptics {}: clicks of a drive of {} ms at the most", folder.display(), cfg.drive);
+                Motor::Timed { folder, drive: cfg.drive }
+            }
+            (None, None, None) => unreachable!("the configuration names a click of one kind"),
         };
-        let ticks = Click::Samples { data: ticks(hz), rate: TICKS_RATE };
-        Ok(Haptics { dev, click, ticks, strength: cfg.strength, playing: Arc::new(Mutex::new(None)), clicks: 0 })
+        Ok(Haptics { motor, strength: cfg.strength, playing: Arc::new(Mutex::new(None)), clicks: 0 })
     }
 
     /// One short click at the strength the slider's `position` gives, after
@@ -116,18 +159,15 @@ impl Haptics {
     /// after taking away what still plays.
     fn start(&mut self, ticks: bool, share: f32) -> Result<Duration> {
         let mut playing = self.playing.lock().expect("no thread panics while it holds the click playing");
-        if let Some((slot, _)) = playing.take() {
-            erase(&self.dev, slot).context("take away the click still playing")?;
+        if let Some((taking, _)) = playing.take() {
+            self.motor.stop(taking).context("take away the click still playing")?;
         }
-        let effect = if ticks { &self.ticks } else { &self.click };
-        let loaded = upload(&self.dev, effect, share).context("load the click")?;
-        play(&mut self.dev, loaded.slot).context("play the click")?;
+        let (taking, length) = self.motor.start(ticks, share)?;
         self.clicks += 1;
-        let this = (loaded.slot, self.clicks);
+        let this = (taking, self.clicks);
         *playing = Some(this);
         drop(playing);
-        let dev = self.dev.try_clone().context("share the motor")?;
-        let length = loaded.length + if ticks { TICKS_REST } else { Duration::ZERO };
+        let motor = self.motor.share()?;
         // Timed from now: a thread may wait a while before it first runs.
         let until = Instant::now() + length;
         let playing = self.playing.clone();
@@ -136,7 +176,7 @@ impl Haptics {
             let mut playing = playing.lock().expect("no thread panics while it holds the click playing");
             if *playing == Some(this) {
                 *playing = None;
-                if let Err(e) = erase(&dev, this.0) {
+                if let Err(e) = motor.stop(this.0) {
                     eprintln!("take away the click: {e}");
                 }
             }
@@ -145,16 +185,69 @@ impl Haptics {
     }
 }
 
+impl Motor {
+    /// Play the click, or the ticks of the screen going off, once at
+    /// `share` of its full strength, saying what takes it away and how
+    /// long it plays.
+    fn start(&self, ticks: bool, share: f32) -> Result<(Taking, Duration)> {
+        match self {
+            Motor::Events { dev, click, ticks: tick } => {
+                let effect = if ticks { tick.as_ref().unwrap_or(click) } else { click };
+                let loaded = upload(dev, effect, share).context("load the click")?;
+                play(dev, loaded.slot).context("play the click")?;
+                // The driver keeps the ticks playing after their samples
+                // run out; the motor comes to rest on its own first.
+                let length = loaded.length + if ticks { TICKS_REST } else { Duration::ZERO };
+                Ok((Taking::Slot(loaded.slot), length))
+            }
+            Motor::Timed { folder, drive } => {
+                // A lighter click is a shorter drive. The voltage the motor
+                // is driven at is the driver's own, and writing it for every
+                // click is a reconfiguration of the driver rather than a
+                // click, and one the motor's datasheet would have to bound.
+                let ms = (*drive as f32 * share).round().max(1.0) as u32;
+                write_at(folder, "duration", &ms.to_string()).with_context(|| format!("ask the driver for a drive of {ms} ms"))?;
+                write_at(folder, "activate", "1").context("ask the driver to start the drive")?;
+                Ok((Taking::Drive, Duration::from_millis(u64::from(ms))))
+            }
+        }
+    }
+
+    /// Stop the click playing, for good.
+    fn stop(&self, taking: Taking) -> io::Result<()> {
+        match (self, taking) {
+            (Motor::Events { dev, .. }, Taking::Slot(slot)) => erase(dev, slot),
+            (Motor::Timed { folder, .. }, Taking::Drive) => write_at(folder, "activate", "0"),
+            // A click of one motor taken away from the other is no click at
+            // all playing, and there is nothing to stop.
+            _ => Ok(()),
+        }
+    }
+
+    /// The same motor again, for the thread that takes the click away.
+    fn share(&self) -> Result<Motor> {
+        Ok(match self {
+            Motor::Events { dev, click, ticks } => {
+                Motor::Events { dev: dev.try_clone().context("share the motor")?, click: click.clone(), ticks: ticks.clone() }
+            }
+            Motor::Timed { folder, drive } => Motor::Timed { folder: folder.clone(), drive: *drive },
+        })
+    }
+}
+
+/// Write one value into a file of the driver's own folder.
+fn write_at(folder: &Path, name: &str, value: &str) -> io::Result<()> {
+    let mut file = OpenOptions::new().write(true).open(folder.join(name))?;
+    file.write_all(value.as_bytes())
+}
+
 /// Play the configured click once at the slider's `position`, or else the
 /// ticks of the screen going off, saying how strongly and for how long, for
 /// trying out a motor.
 pub fn probe(cfg: &skyward_config::Haptics, position: f32, ticks: bool) -> Result<()> {
     let mut haptics = Haptics::open(cfg)?;
-    let (what, strength, length) = if ticks {
-        ("ticks", TICKS_STRENGTH, haptics.ticks()?)
-    } else {
-        ("click", share(&cfg.strength, position), haptics.click(position)?)
-    };
+    let (what, strength, length) =
+        if ticks { ("ticks", TICKS_STRENGTH, haptics.ticks()?) } else { ("click", share(&cfg.strength, position), haptics.click(position)?) };
     // Once it has played out, what played goes with the device as the
     // command ends.
     std::thread::sleep(length);
@@ -164,7 +257,7 @@ pub fn probe(cfg: &skyward_config::Haptics, position: f32, ticks: bool) -> Resul
 
 /// The first input device under /dev/input that takes periodic
 /// force-feedback effects, opened for writing.
-fn motor() -> Result<(PathBuf, File)> {
+fn events() -> Result<(PathBuf, File)> {
     for (path, dev) in evdev::raw_stream::enumerate() {
         if takes_periodic(&dev) {
             let file = OpenOptions::new().read(true).write(true).open(&path).with_context(|| format!("open {}", path.display()))?;
@@ -308,10 +401,11 @@ fn upload(dev: &File, click: &Click, share: f32) -> Result<Loaded> {
 }
 
 /// Start the loaded effect in slot `id`.
-fn play(dev: &mut File, id: i16) -> io::Result<()> {
+fn play(dev: &File, id: i16) -> io::Result<()> {
+    let mut out = dev;
     let event = libc::input_event { time: libc::timeval { tv_sec: 0, tv_usec: 0 }, type_: EV_FF, code: id as u16, value: 1 };
     let bytes = unsafe { std::slice::from_raw_parts((&event as *const libc::input_event).cast::<u8>(), std::mem::size_of::<libc::input_event>()) };
-    dev.write_all(bytes)
+    out.write_all(bytes)
 }
 
 /// Take the effect in slot `id` away, which stops it for good.

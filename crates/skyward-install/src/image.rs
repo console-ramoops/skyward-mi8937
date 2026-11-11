@@ -18,6 +18,19 @@ const VENDOR_BOOT_MAGIC: &[u8] = b"VNDRBOOT";
 const DTBO_MAGIC: &[u8] = &[0xd7, 0xb7, 0xab, 0x1e];
 const VBMETA_MAGIC: &[u8] = b"AVB0";
 
+/// Where each filesystem's magic stands in an image of it. A filesystem
+/// image has no Android header: what it is, is its superblock. erofs and
+/// ext4 both start their superblock a kilobyte in, but erofs puts its magic
+/// at the start of it and ext4 keeps `s_magic` 56 bytes into it, at 1080;
+/// f2fs starts its superblock at `F2FS_SUPER_OFFSET`, a kilobyte in as well,
+/// with `s_magic` as the first field.
+const EROFS: usize = 1024;
+const EROFS_MAGIC: &[u8] = &[0xe2, 0xe1, 0xf5, 0xe0];
+const EXT4: usize = 1024 + 56;
+const EXT4_MAGIC: &[u8] = &[0x53, 0xef];
+const F2FS: usize = 1024;
+const F2FS_MAGIC: &[u8] = &[0x10, 0x20, 0xf5, 0xf2];
+
 /// How a ramdisk is packed, by its first bytes: LZ4 in the legacy framing
 /// Android uses or the standard one, gzip, or a bare newc archive.
 const LZ4_LEGACY: &[u8] = &[0x02, 0x21, 0x4c, 0x18];
@@ -38,10 +51,26 @@ const CHUNK: usize = 1 << 20;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ImageKind {
     /// A boot image; what it carries decides where it can go.
-    Boot { kernel: bool, ramdisk: Ramdisk },
+    Boot {
+        kernel: bool,
+        ramdisk: Ramdisk,
+    },
     VendorBoot,
     Dtbo,
     Vbmeta,
+    /// A partition that holds a filesystem, given as the filesystem itself:
+    /// what a system, vendor or cache image of a phone that keeps its
+    /// partitions that way ships as.
+    Filesystem(Filesystem),
+}
+
+/// The filesystem a whole partition holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Filesystem {
+    /// The read-only filesystem newer systems ship their partitions in.
+    Erofs,
+    Ext4,
+    F2fs,
 }
 
 /// The ramdisk a boot image carries.
@@ -67,6 +96,11 @@ impl ImageKind {
             ImageKind::VendorBoot => &["vendor_boot"],
             ImageKind::Dtbo => &["dtbo"],
             ImageKind::Vbmeta => &["vbmeta", "vbmeta_system", "vbmeta_vendor"],
+            // The partitions a phone keeps a filesystem on. The data
+            // partition is left out: making it afresh is a wipe's work, and
+            // a package that writes it whole would take the users' files
+            // with it without asking them the way the wipe page does.
+            ImageKind::Filesystem(_) => &["system", "vendor", "cust", "product", "odm", "system_ext", "vendor_dlkm", "system_dlkm", "cache"],
         }
     }
 }
@@ -97,6 +131,18 @@ pub fn detect<R: Read + Seek>(file: &mut R, head: &[u8]) -> Result<Option<ImageK
     if head.starts_with(VBMETA_MAGIC) {
         return Ok(Some(ImageKind::Vbmeta));
     }
+    // What is left is a filesystem, read off its own superblock: erofs's
+    // magic a kilobyte in, ext4's 56 bytes further on, f2fs's a kilobyte in
+    // as well -- the same place erofs keeps its own, told apart by the word.
+    if head.len() > EROFS + EROFS_MAGIC.len() && head[EROFS..].starts_with(EROFS_MAGIC) {
+        return Ok(Some(ImageKind::Filesystem(Filesystem::Erofs)));
+    }
+    if head.len() > EXT4 + EXT4_MAGIC.len() && head[EXT4..].starts_with(EXT4_MAGIC) {
+        return Ok(Some(ImageKind::Filesystem(Filesystem::Ext4)));
+    }
+    if head.len() > F2FS + F2FS_MAGIC.len() && head[F2FS..].starts_with(F2FS_MAGIC) {
+        return Ok(Some(ImageKind::Filesystem(Filesystem::F2fs)));
+    }
     Ok(None)
 }
 
@@ -125,6 +171,9 @@ fn find<T>(packed: impl Read, wanted: impl Fn(&str) -> bool, take: impl FnOnce(&
         Box::new(flate2::bufread::MultiGzDecoder::new(packed))
     } else if start.starts_with(NEWC) {
         Box::new(packed)
+    } else if is_lzma(start) {
+        let stream = liblzma::stream::Stream::new_lzma_decoder(128 << 20).context("LZMA decoder")?;
+        Box::new(liblzma::read::XzDecoder::new_stream(packed, stream))
     } else {
         bail!("a ramdisk packed in an unknown way, starting {:02x?}", &start[..start.len().min(4)]);
     };
@@ -138,6 +187,10 @@ fn find<T>(packed: impl Read, wanted: impl Fn(&str) -> bool, take: impl FnOnce(&
         }
         rest = entry.finish().context("read past a ramdisk entry")?;
     }
+}
+
+fn is_lzma(bytes: &[u8]) -> bool {
+    bytes.len() >= 13 && bytes[0] < 225 && (4096..=64 << 20).contains(&u32::from_le_bytes(bytes[1..5].try_into().expect("four dictionary bytes")))
 }
 
 /// Whether `file` is a Skyward recovery: a boot image whose ramdisk carries
@@ -162,7 +215,7 @@ pub fn device_config<R: Read + Seek>(file: &mut R) -> Result<Option<Vec<u8>>> {
     file.seek(SeekFrom::Start(header.ramdisk_position() as u64)).context("seek to the ramdisk")?;
     let mut ramdisk = BufReader::new(file.take(u64::from(header.ramdisk_size())));
     let start = ramdisk.fill_buf().context("read the ramdisk's first bytes")?;
-    if ![LZ4_LEGACY, LZ4_FRAME, GZIP, NEWC].iter().any(|magic| start.starts_with(magic)) {
+    if ![LZ4_LEGACY, LZ4_FRAME, GZIP, NEWC].iter().any(|magic| start.starts_with(magic)) && !is_lzma(start) {
         return Ok(None);
     }
     let read = |entry: &mut dyn Read| {
@@ -178,16 +231,24 @@ pub fn device(dir: &Path, name: &str, slot: Slot) -> PathBuf {
     dir.join(format!("{name}{}", slot.suffix()))
 }
 
-/// The partitions `kind` fits that this phone has in both slots, among the
-/// links in `dir`, the likeliest first.
-pub fn partitions(kind: ImageKind, dir: &Path) -> Result<Vec<&'static str>> {
+/// The partition `name` of a phone that keeps one set of them, among the
+/// links in `dir`: it is reached by its own name, with no slot after it.
+pub fn bare(dir: &Path, name: &str) -> PathBuf {
+    dir.join(name)
+}
+
+/// The partitions `kind` fits that this phone has, among the links in
+/// `dir`, the likeliest first: of both slots where the phone keeps a set of
+/// partitions per slot, since an image of one slot's alone would be half of
+/// what it installs to, and by its own name where it has a single set.
+pub fn partitions(kind: ImageKind, dir: &Path, slots: Option<Slot>) -> Result<Vec<&'static str>> {
+    let here = |path: PathBuf| -> Result<bool> { path.try_exists().with_context(|| format!("look for {}", path.display())) };
     let mut found = Vec::new();
     for name in kind.partitions() {
-        let mut has = true;
-        for slot in [Slot::A, Slot::B] {
-            let path = device(dir, name, slot);
-            has &= path.try_exists().with_context(|| format!("look for {}", path.display()))?;
-        }
+        let has = match slots {
+            Some(_) => here(device(dir, name, Slot::A))? && here(device(dir, name, Slot::B))?,
+            None => here(bare(dir, name))?,
+        };
         if has {
             found.push(*name);
         }
@@ -341,6 +402,61 @@ mod tests {
         detect(&mut Cursor::new(image), &image[..image.len().min(4096)])
     }
 
+    /// A partition of `size` bytes holding a filesystem with its magic
+    /// where the filesystem's own header says it stands. The places are
+    /// written out here rather than taken from the constants above, so the
+    /// test is the fact on the disk and not a restatement of the code:
+    /// erofs's `h_magic` is the first word of the superblock at 1024
+    /// (erofs_fs.h), ext4's `s_magic` is 0x38 into the superblock at 1024,
+    /// so 1080 (ext4.h), and f2fs's `s_magic` is the first word of the
+    /// superblock at `F2FS_SUPER_OFFSET`, 1024 (f2fs_fs.h) -- the same
+    /// place as erofs's, told apart by the word.
+    fn filesystem_image(kind: Filesystem, size: usize) -> Vec<u8> {
+        let (at, magic): (usize, &[u8]) = match kind {
+            Filesystem::Erofs => (1024, &[0xe2, 0xe1, 0xf5, 0xe0]),
+            Filesystem::Ext4 => (1080, &[0x53, 0xef]),
+            Filesystem::F2fs => (1024, &[0x10, 0x20, 0xf5, 0xf2]),
+        };
+        let mut out = vec![0u8; size];
+        out[at..at + magic.len()].copy_from_slice(magic);
+        out
+    }
+
+    #[test]
+    fn an_ext4_superblock_is_read_where_its_magic_stands_not_where_it_starts() {
+        // What an ext4 superblock really starts with is s_inodes_count, and
+        // an image that reads as anything at 1024 is still ext4 where its
+        // own magic stands.
+        let mut image = vec![0u8; 8192];
+        image[1024..1028].copy_from_slice(&65_536u32.to_le_bytes());
+        image[1080..1082].copy_from_slice(&0xEF53u16.to_le_bytes());
+        assert_eq!(kind_of(&image).unwrap().as_ref(), Some(&ImageKind::Filesystem(Filesystem::Ext4)));
+    }
+
+    #[test]
+    fn a_whole_partition_is_known_by_its_own_superblock() {
+        for kind in [Filesystem::Erofs, Filesystem::Ext4, Filesystem::F2fs] {
+            let image = filesystem_image(kind, 8192);
+            assert_eq!(kind_of(&image).unwrap().as_ref(), Some(&ImageKind::Filesystem(kind)), "{kind:?}");
+        }
+        // An empty partition is no image this recovery writes.
+        assert_eq!(kind_of(&[0u8; 8192]).unwrap(), None);
+    }
+
+    #[test]
+    fn a_filesystem_image_is_offered_the_partitions_the_phone_has() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["system", "cust", "cache", "boot", "modem"] {
+            std::fs::File::create(dir.path().join(name)).unwrap();
+        }
+        let erofs = ImageKind::Filesystem(Filesystem::Erofs);
+        assert_eq!(
+            partitions(erofs, dir.path(), None).unwrap(),
+            ["system", "cust", "cache"],
+            "this phone's vendor files are in cust, and it has no product or odm"
+        );
+    }
+
     #[test]
     fn boot_images_go_where_what_they_carry_fits() {
         let recovery = archive(&["init", "system", "system/bin", "system/bin/recovery", "sbin"]);
@@ -382,6 +498,18 @@ mod tests {
     }
 
     #[test]
+    fn the_mi8937_lzma_recovery_is_detected_and_its_configuration_is_read() {
+        let mut ramdisk = skyward_bootimg::Ramdisk { entries: Vec::new() };
+        ramdisk.add("system/bin/recovery", 0o755, b"wrapper".to_vec()).unwrap();
+        let config = b"[device]\ncodename = \"mi8937_4_19\"\nab = false\n";
+        ramdisk.add("skyward/device.toml", 0o644, config.to_vec()).unwrap();
+        let packed = ramdisk.encode(skyward_bootimg::Format::Lzma).unwrap();
+        let image = boot_image(0, &packed);
+        assert_eq!(kind_of(&image).unwrap(), Some(ImageKind::Boot { kernel: false, ramdisk: Ramdisk::Recovery }));
+        assert_eq!(device_config(&mut Cursor::new(image)).unwrap().unwrap(), config);
+    }
+
+    #[test]
     fn other_images_are_told_by_their_magic() {
         let vendor = VendorHeader {
             page_size: 4096,
@@ -409,15 +537,26 @@ mod tests {
     }
 
     #[test]
+    fn a_phone_with_one_set_of_partitions_is_offered_the_names_it_has() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["boot", "recovery", "cust", "modem"] {
+            std::fs::File::create(dir.path().join(name)).unwrap();
+        }
+        let both = ImageKind::Boot { kernel: true, ramdisk: Ramdisk::Recovery };
+        assert_eq!(partitions(both, dir.path(), None).unwrap(), ["recovery", "boot"], "the one recovery partition, and boot's");
+        assert!(partitions(ImageKind::Dtbo, dir.path(), None).unwrap().is_empty(), "no dtbo of its own here");
+    }
+
+    #[test]
     fn only_partitions_the_phone_has_in_both_slots_are_offered() {
         let dir = tempfile::tempdir().unwrap();
         for name in ["boot_a", "boot_b", "recovery_a", "recovery_b", "init_boot_a", "init_boot_b", "vbmeta_a", "vbmeta_b", "vbmeta_system_a"] {
             std::fs::File::create(dir.path().join(name)).unwrap();
         }
         let both = ImageKind::Boot { kernel: true, ramdisk: Ramdisk::Recovery };
-        assert_eq!(partitions(both, dir.path()).unwrap(), ["recovery", "boot"]);
-        assert_eq!(partitions(ImageKind::Vbmeta, dir.path()).unwrap(), ["vbmeta"]);
-        assert!(partitions(ImageKind::Dtbo, dir.path()).unwrap().is_empty());
+        assert_eq!(partitions(both, dir.path(), Some(Slot::A)).unwrap(), ["recovery", "boot"]);
+        assert_eq!(partitions(ImageKind::Vbmeta, dir.path(), Some(Slot::A)).unwrap(), ["vbmeta"]);
+        assert!(partitions(ImageKind::Dtbo, dir.path(), Some(Slot::A)).unwrap().is_empty());
     }
 
     /// A partition of `size` bytes filled with 0xAA, so untouched bytes

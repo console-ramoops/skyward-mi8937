@@ -121,16 +121,15 @@ pub struct Hardware {
 }
 
 /// The phone's key service, as this program talks to it.
-pub struct KeyMint<'a> {
+pub struct Newer<'a> {
     device: Handle<'a>,
 }
 
-impl<'a> KeyMint<'a> {
+impl<'a> Newer<'a> {
     /// Reach the running key service, or say that none is.
-    pub fn open(binder: &'a Binder) -> Result<KeyMint<'a>> {
-        let device = service::find(binder, SERVICE)?
-            .with_context(|| format!("{SERVICE} is not running; the phone's key service has to be started first"))?;
-        Ok(KeyMint { device })
+    pub fn open(binder: &'a Binder) -> Result<Newer<'a>> {
+        let device = service::find(binder, SERVICE)?.with_context(|| format!("{SERVICE} is not running; the phone's key service has to be started first"))?;
+        Ok(Newer { device })
     }
 
     pub fn hardware(&self) -> Result<Hardware> {
@@ -138,12 +137,7 @@ impl<'a> KeyMint<'a> {
         let mut read = reply.read();
         status::ok(&mut read).context("ask the key service about itself")?;
         let end = read.structure()?;
-        let info = Hardware {
-            version: read.i32()?,
-            security_level: read.i32()?,
-            name: read.string()?,
-            author: read.string()?,
-        };
+        let info = Hardware { version: read.i32()?, security_level: read.i32()?, name: read.string()?, author: read.string()? };
         read.go(end)?;
         Ok(info)
     }
@@ -220,9 +214,7 @@ impl<'a> KeyMint<'a> {
                 // made. Renewing it gives a key for the firmware running
                 // now; the one on disk is left as it is, so nothing of the
                 // phone's own is changed by reading it here.
-                let renewed = self
-                    .upgrade(key_blob, |call| Self::gcm_params(call, app_id, nonce))
-                    .context("renew the key for the firmware running now")?;
+                let renewed = self.upgrade(key_blob, |call| Self::gcm_params(call, app_id, nonce)).context("renew the key for the firmware running now")?;
                 self.begin(&renewed, app_id, nonce, note)?
             }
             Err(e) => return Err(e),
@@ -335,5 +327,72 @@ impl<'a> KeyMint<'a> {
     pub fn usable(&self, key_blob: &[u8], app_id: &[u8]) -> Result<()> {
         let operation = self.begin(key_blob, app_id, &[0; NONCE_BYTES], None)?;
         self.abort(&operation)
+    }
+}
+
+/// The phone's key service, whichever kind it has.
+///
+/// A phone has one of two: the newer kind, registered with the service
+/// directory and spoken over binder, or the older kind, a hardware module
+/// loaded into this process and spoken over its own C interface. Which one
+/// is not a matter of taste — the Mi 6's is a **passthrough** implementation
+/// that never registers at all — so this tries the directory first and falls
+/// back to the module, and everything above it is written once.
+pub enum KeyMint<'a> {
+    Newer(Newer<'a>),
+    Older(crate::keymaster1::Keymaster1),
+}
+
+impl<'a> KeyMint<'a> {
+    /// Reach whichever key service the phone has.
+    pub fn open(binder: &'a Binder) -> Result<KeyMint<'a>> {
+        match service::find(binder, SERVICE) {
+            Ok(Some(_)) => Ok(KeyMint::Newer(Newer::open(binder)?)),
+            _ => Ok(KeyMint::Older(crate::keymaster1::Keymaster1::open()?)),
+        }
+    }
+
+    pub fn hardware(&self) -> Result<Hardware> {
+        match self {
+            KeyMint::Newer(service) => service.hardware(),
+            KeyMint::Older(_) => Ok(Hardware { version: 1, security_level: 1, name: "the phone's own key module".into(), author: "Qualcomm".into() }),
+        }
+    }
+
+    /// Turn a key only the storage hardware can use into the form it takes
+    /// for this start of the phone. The older kind has no such call: it is
+    /// the newer kind's answer to a key wrapped for the storage hardware,
+    /// which a phone of this age does not keep.
+    pub fn ephemeral_storage_key(&self, key: &[u8]) -> Result<Vec<u8>> {
+        match self {
+            KeyMint::Newer(service) => service.ephemeral_storage_key(key),
+            KeyMint::Older(_) => anyhow::bail!("the phone's key hardware has no way to make a storage key for this start"),
+        }
+    }
+
+    pub fn authorizations(&self, key_blob: &[u8], app_id: &[u8]) -> Result<Vec<(i32, i64)>> {
+        match self {
+            KeyMint::Newer(service) => service.authorizations(key_blob, app_id),
+            KeyMint::Older(service) => Ok(service.authorizations(key_blob, app_id)?.into_iter().map(|(tag, value)| (tag as i32, value as i64)).collect()),
+        }
+    }
+
+    pub fn gcm_decrypt(&self, key_blob: &[u8], app_id: &[u8], nonce: &[u8], body: &[u8], note: Option<&Token>) -> Result<Vec<u8>> {
+        match self {
+            KeyMint::Newer(service) => service.gcm_decrypt(key_blob, app_id, nonce, body, note),
+            // The older kind is handed the note the same way the newer one
+            // is, as a value carried alongside the call: `keymaster_defs.h`
+            // names a tag for it, and the hardware checks the signature the
+            // secure world wrote over it before it will use a key the note
+            // guards.
+            KeyMint::Older(service) => service.gcm_decrypt_with(key_blob, app_id, nonce, body, note.map(|note| note.bytes()).as_deref()),
+        }
+    }
+
+    pub fn usable(&self, key_blob: &[u8], app_id: &[u8]) -> Result<()> {
+        match self {
+            KeyMint::Newer(service) => service.usable(key_blob, app_id),
+            KeyMint::Older(service) => service.usable(key_blob, app_id),
+        }
     }
 }

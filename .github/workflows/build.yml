@@ -80,9 +80,13 @@ jobs:
         run: |
           if [ -n "$DEVICE" ]; then
             test -f "devices/$DEVICE.toml"
+            if [ "$DEVICE" = mi8937_4_19 ]; then
+              echo 'Use the Build Mi-Thorium mi8937_4_19 workflow with a base recovery image.' >&2
+              exit 1
+            fi
             echo "devices=$(jq -nc --arg device "$DEVICE" '[$device]')" >> "$GITHUB_OUTPUT"
           else
-            echo "devices=$(basename -s .toml devices/*.toml | jq -R . | jq -sc .)" >> "$GITHUB_OUTPUT"
+            echo "devices=$(basename -s .toml devices/*.toml | sed '/^mi8937_4_19$/d' | jq -R . | jq -sc .)" >> "$GITHUB_OUTPUT"
           fi
 
   recovery:
@@ -179,6 +183,7 @@ jobs:
           zips=()
           for config in devices/*.toml; do
             device=$(basename "$config" .toml)
+            if [ "$device" = mi8937_4_19 ]; then continue; fi
             model=$(python3 -c 'import sys, tomllib; print(tomllib.load(open(sys.argv[1], "rb"))["device"]["model"])' "$config")
             zip=$(ls images/skyward-"$GITHUB_REF_NAME"-"$device"-*.zip)
             zips+=("$zip#$model ($device)")

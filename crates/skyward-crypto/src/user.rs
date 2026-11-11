@@ -420,15 +420,29 @@ mod tests {
     fn stretching_matches_the_published_answer_for_the_cost_the_phone_names() {
         let lock = Lock { kind: Lock::PASSWORD, cost: [10, 3, 4], salt: b"NaCl".to_vec(), enrolled: Vec::new() };
         let out = lock.stretched(b"password").unwrap();
-        assert_eq!(
-            out.iter().map(|b| format!("{b:02x}")).collect::<String>(),
-            "fdbabe1c9d3472007856e7190d01e9fe7c6ad7cbc8237830e77376634b373162"
-        );
+        assert_eq!(out.iter().map(|b| format!("{b:02x}")).collect::<String>(), "fdbabe1c9d3472007856e7190d01e9fe7c6ad7cbc8237830e77376634b373162");
     }
 
     #[test]
     fn a_cost_no_machine_could_pay_is_an_error_rather_than_a_wait() {
         let lock = Lock { kind: Lock::PIN, cost: [64, 3, 1], salt: b"salt".to_vec(), enrolled: Vec::new() };
         assert!(lock.stretched(b"1234").is_err());
+    }
+}
+
+#[cfg(test)]
+mod scrypt_check {
+    /// The second vector of RFC 7914, which every scrypt must reproduce.
+    #[test]
+    fn scrypt_matches_the_published_vector() {
+        let mut out = vec![0u8; 64];
+        let params = scrypt::Params::new(10, 8, 16, 64).unwrap();
+        scrypt::scrypt(b"password", b"NaCl", &params, &mut out).unwrap();
+        let want: [u8; 64] = [
+            0xfd, 0xba, 0xbe, 0x1c, 0x9d, 0x34, 0x72, 0x00, 0x78, 0x56, 0xe7, 0x19, 0x0d, 0x01, 0xe9, 0xfe, 0x7c, 0x6a, 0xd7, 0xcb, 0xc8, 0x23, 0x78, 0x30,
+            0xe7, 0x73, 0x76, 0x63, 0x4b, 0x37, 0x31, 0x62, 0x2e, 0xaf, 0x30, 0xd9, 0x2e, 0x22, 0xa3, 0x88, 0x6f, 0xf1, 0x09, 0x27, 0x9d, 0x98, 0x30, 0xda,
+            0xc7, 0x27, 0xaf, 0xb9, 0x4a, 0x83, 0xee, 0x6d, 0x83, 0x60, 0xcb, 0xdf, 0xa2, 0xcc, 0x06, 0x40,
+        ];
+        assert_eq!(out, want);
     }
 }

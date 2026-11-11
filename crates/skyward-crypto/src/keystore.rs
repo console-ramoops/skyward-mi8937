@@ -25,6 +25,32 @@ const FN_KEY_BLOB: &str = "keymaster_key_blob";
 const FN_SECDISCARDABLE: &str = "secdiscardable";
 const FN_STRETCHING: &str = "stretching";
 
+/// What Android writes in `stretching` for a key that is not stretched with
+/// a credential of its own.
+///
+/// `nopassword` is a key the hardware alone holds, which is what a phone
+/// with no screen lock keeps: there is no credential anywhere. `none` is a
+/// key whose credential is kept **behind** it rather than stretched into it
+/// — the key's own secret comes from the blob the secure world holds, and
+/// that blob is what the credential opens. It is what the phone writes for a
+/// user's own key the moment a screen lock is set: measured on the Mi 6,
+/// `stretching` went from `nopassword` to `none` when a PIN was set, and the
+/// key stopped coming apart on the word alone.
+const NOT_STRETCHED: [&str; 2] = ["nopassword", "none"];
+
+/// What Android's key storage writes in front of the blob the hardware made:
+/// the module's own blob is the rest of the file, measured by having it make
+/// one of its own — four hundred and twenty-seven bytes beginning `DKMK`.
+const BLOB_MAGIC: &[u8] = b"pKMblob\0";
+
+/// The blob without that word, which is what the hardware is given.
+pub fn bare_blob(raw: Vec<u8>) -> Vec<u8> {
+    match raw.starts_with(BLOB_MAGIC) {
+        true => raw[BLOB_MAGIC.len()..].to_vec(),
+        false => raw,
+    }
+}
+
 /// SHA-512 of `data` behind a fixed prefix.
 pub fn hash_with_prefix(prefix: &[u8], data: &[u8]) -> Vec<u8> {
     let mut padded = prefix.to_vec();
@@ -69,15 +95,24 @@ impl StoredKey {
         if version.trim() != VERSION {
             bail!("{} is written in layout {}, Skyward reads layout {VERSION}", dir.display(), version.trim());
         }
+        // A key wrapped with a credential is **stretched** first, and the
+        // token that says how is kept beside it. Android wrote the word
+        // `nopassword` where no credential was involved at all and `none`
+        // where the credential is kept behind the key instead of stretched
+        // into it, and those are the two this program can undo: the others
+        // need the credential's own stretching, which is not on the phone.
         if dir.join(FN_STRETCHING).exists() {
-            bail!("{} was written by an Android too old for Skyward to read", dir.display());
+            let said = fs::read_to_string(dir.join(FN_STRETCHING)).with_context(|| format!("read {}", dir.join(FN_STRETCHING).display()))?;
+            if !NOT_STRETCHED.contains(&said.trim()) {
+                bail!("{} was wrapped with a credential's stretching ({:?}), which this program cannot undo", dir.display(), said.trim());
+            }
         }
         let secdiscardable_hash = match dir.join(FN_SECDISCARDABLE).exists() {
             true => hash_with_prefix(SECDISCARDABLE_PREFIX, &read(FN_SECDISCARDABLE)?),
             false => Vec::new(),
         };
         let key_blob = match dir.join(FN_KEY_BLOB).exists() {
-            true => Some(read(FN_KEY_BLOB)?),
+            true => Some(bare_blob(read(FN_KEY_BLOB)?)),
             false => None,
         };
         Ok(StoredKey { encrypted: read(FN_ENCRYPTED_KEY)?, key_blob, secdiscardable_hash })
@@ -107,11 +142,18 @@ impl StoredKey {
         let (nonce, body) = self.encrypted.split_at(NONCE_BYTES);
         match how {
             Unwrap::Hardware(service) => {
-                let blob = self
-                    .key_blob
-                    .as_ref()
-                    .context("this key is wrapped by a secret, and none was given")?;
-                service.gcm_decrypt(blob, &self.app_id(&[]), nonce, body)
+                let blob = self.key_blob.as_ref().context("this key is wrapped by a secret, and none was given")?;
+                // A key the phone keeps for a directory may be bound to that
+                // directory's hash or to nothing at all, and nothing in the
+                // files says which. The hardware refuses the wrong binding at
+                // the last step, where nothing has been yielded, so it is
+                // asked the other way — and the key's own answer, in what it
+                // is for, is what says which it was.
+                let bound = self.app_id(&[]);
+                match service.gcm_decrypt(blob, &bound, nonce, body) {
+                    Err(_) if !bound.is_empty() => service.gcm_decrypt(blob, &[], nonce, body),
+                    other => other,
+                }
             }
             Unwrap::Secret(secret) => decrypt_with_secret(&self.app_id(secret), nonce, body),
         }
@@ -174,11 +216,7 @@ mod tests {
     }
 
     fn stored(secdiscardable: &[u8], encrypted: Vec<u8>) -> StoredKey {
-        StoredKey {
-            encrypted,
-            key_blob: None,
-            secdiscardable_hash: hash_with_prefix(SECDISCARDABLE_PREFIX, secdiscardable),
-        }
+        StoredKey { encrypted, key_blob: None, secdiscardable_hash: hash_with_prefix(SECDISCARDABLE_PREFIX, secdiscardable) }
     }
 
     #[test]
@@ -226,12 +264,28 @@ mod tests {
     }
 
     #[test]
+    fn a_key_whose_credential_is_kept_behind_it_is_read() {
+        // A phone with a screen lock writes `none` beside the user's own key:
+        // the credential is not stretched into the key, it is what opens the
+        // blob the key's secret comes from. Reading the key must not stop on
+        // that word — measured on the Mi 6, whose key went from `nopassword`
+        // to `none` the moment a PIN was set, and which then answered "this
+        // program cannot undo" for a password that was right.
+        let dir = tempdir("none-stretching");
+        fs::write(dir.join(FN_VERSION), "1").unwrap();
+        fs::write(dir.join(FN_ENCRYPTED_KEY), [0u8; 64]).unwrap();
+        fs::write(dir.join(FN_STRETCHING), "none").unwrap();
+        let s = StoredKey::load(&dir).unwrap();
+        assert_eq!(s.encrypted.len(), 64);
+    }
+
+    #[test]
     fn a_directory_in_an_older_layout_is_refused() {
         let dir = tempdir("older-layout");
         fs::write(dir.join(FN_VERSION), "1").unwrap();
         fs::write(dir.join(FN_ENCRYPTED_KEY), [0u8; 64]).unwrap();
         fs::write(dir.join(FN_STRETCHING), "scrypt 15 8 1").unwrap();
-        assert!(refusal(&dir).contains("too old"), "{}", refusal(&dir));
+        assert!(refusal(&dir).contains("credential's stretching"), "{}", refusal(&dir));
         fs::remove_file(dir.join(FN_STRETCHING)).unwrap();
         fs::write(dir.join(FN_VERSION), "2").unwrap();
         assert!(refusal(&dir).contains("layout 2"), "{}", refusal(&dir));

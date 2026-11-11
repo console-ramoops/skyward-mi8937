@@ -26,6 +26,8 @@ const FLAGS: [(&str, u64); 18] = [
     ("defaults", 0),
 ];
 
+use anyhow::Context;
+
 /// Split the mount options of a phone's table into the kernel's flags and
 /// the options the filesystem reads, joined the way the kernel takes them.
 pub fn split_options(options: &[String]) -> (u64, String) {
@@ -46,6 +48,23 @@ pub struct Visible {
     /// (major, minor) of the mounted device.
     pub device: (u32, u32),
     pub filesystem: String,
+}
+
+/// Make `target` able to hold a mount.
+///
+/// A table written for the running system can name a mount point that is a
+/// link into another partition: this phone's `/cache` is a link to
+/// `/data/cache`, and where the system never made that folder, mounting
+/// follows the link and finds nothing -- so the link gives way to the
+/// folder the table means, for as long as the recovery runs. A link that
+/// does lead somewhere is left alone, since its target is where the phone
+/// keeps what it mounts there.
+pub fn prepare(target: &std::path::Path) -> anyhow::Result<()> {
+    let nowhere = std::fs::symlink_metadata(target).ok().is_some_and(|meta| meta.file_type().is_symlink() && !target.exists());
+    if nowhere {
+        std::fs::remove_file(target).with_context(|| format!("take the link off {}", target.display()))?;
+    }
+    std::fs::create_dir_all(target).with_context(|| format!("make {}", target.display()))
 }
 
 #[cfg(target_os = "android")]
@@ -89,9 +108,7 @@ mod sys {
             let e = os_error();
             match e.raw_os_error() {
                 Some(libc::EINVAL | libc::ENODEV) => refused.push(format!("{fs}: {e}")),
-                _ => {
-                    return Err(e).with_context(|| format!("mount {} on {} as {fs}", device.display(), target.display()))
-                }
+                _ => return Err(e).with_context(|| format!("mount {} on {} as {fs}", device.display(), target.display())),
             }
         }
         bail!("{} holds none of {} ({})", device.display(), FILESYSTEMS.join(", "), refused.join("; "))
@@ -105,8 +122,7 @@ mod sys {
         let ty = CString::new(filesystem).with_context(|| format!("{filesystem} holds a NUL"))?;
         let data = CString::new(own.as_str()).with_context(|| format!("{own} holds a NUL"))?;
         if unsafe { libc::mount(src.as_ptr(), dst.as_ptr(), ty.as_ptr(), flags as libc::c_ulong, data.as_ptr().cast()) } != 0 {
-            return Err(os_error())
-                .with_context(|| format!("mount {} on {} as {filesystem} with {}", device.display(), target.display(), options.join(",")));
+            return Err(os_error()).with_context(|| format!("mount {} on {} as {filesystem} with {}", device.display(), target.display(), options.join(",")));
         }
         Ok(())
     }
@@ -351,7 +367,9 @@ mod sys {
         for p in all_processes().context("list the processes")? {
             let Some(p) = present(p)? else { continue };
             // Kernel threads have no executable and hold no files.
-            let Some(exe) = present(p.exe())? else { continue };
+            let Some(exe) = present(p.exe())? else {
+                continue;
+            };
             let name = exe.file_name().with_context(|| format!("{} has no file name", exe.display()))?.to_string_lossy().into_owned();
             let proc_dir = Path::new("/proc").join(p.pid().to_string());
             let mut devices = Vec::new();
@@ -466,13 +484,31 @@ mod sys {
 }
 
 pub use sys::{
-    bind, holders, holding, is_mount_point, mount, mount_ids, mount_ro, mount_ro_over, points_of, remount_writable, umount,
-    umount_detach, umount_detach_over, umount_over, visible,
+    bind, holders, holding, is_mount_point, mount, mount_ids, mount_ro, mount_ro_over, points_of, remount_writable, umount, umount_detach, umount_detach_over,
+    umount_over, visible,
 };
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_mount_point_that_links_nowhere_gives_way_to_a_folder() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("data");
+        std::fs::create_dir(&data).unwrap();
+        let at = dir.path().join("cache");
+        std::os::unix::fs::symlink(data.join("cache"), &at).unwrap();
+        prepare(&at).unwrap();
+        assert!(std::fs::symlink_metadata(&at).unwrap().is_dir(), "the link gives way to the folder the table means");
+        // A link that leads somewhere is left to lead there.
+        let there = dir.path().join("there");
+        std::fs::create_dir(&there).unwrap();
+        let via = dir.path().join("via");
+        std::os::unix::fs::symlink(&there, &via).unwrap();
+        prepare(&via).unwrap();
+        assert!(std::fs::symlink_metadata(&via).unwrap().file_type().is_symlink(), "its target is where the phone keeps what goes there");
+    }
 
     #[test]
     fn the_kernels_flags_are_taken_out_of_a_phones_mount_options() {

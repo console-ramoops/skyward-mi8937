@@ -2,12 +2,12 @@ use crate::backup;
 use crate::decrypt::{self, Decryptor};
 use crate::filework;
 use crate::haptics::Haptics;
-use crate::relabel;
 use crate::input::{monotonic_ms, Event, Inputs};
 use crate::merge;
 use crate::partwork;
 use crate::pty;
 use crate::readings::{Reading, Readings};
+use crate::relabel;
 use crate::secure;
 use crate::services;
 use crate::settings;
@@ -17,31 +17,30 @@ use crate::wipe::{self, Eraser, Step};
 use crate::wlan;
 use anyhow::{anyhow, ensure, Context, Result};
 use skyward_block::fsck::Fixed;
+use skyward_block::usb::{self, Drive};
 use skyward_block::{fstab, mount, probe};
 use skyward_config::{DeviceConfig, Service};
 use skyward_crypto::data::{Closed, Opened};
+use skyward_files::Ownership;
 use skyward_install::asked::{self, Needs};
 use skyward_install::{Detach, Installer, Options};
-use skyward_sys::bcb::{self, Work, REFORMATS};
-use skyward_sys::control::{Control, Request};
-use skyward_sys::Power;
-use skyward_files::Ownership;
-use skyward_block::usb::{self, Drive};
 use skyward_net::download::{self, Failure};
 use skyward_net::http::Servers;
 use skyward_net::release::{Installed, Release, Unanswered};
 use skyward_net::wlan::{Power as WlanPower, Stage as Joining, Wlan};
+use skyward_sys::bcb::{self, Work, REFORMATS};
+use skyward_sys::control::{Control, Request};
 use skyward_sys::sleep::{Sleeper, Slept};
 use skyward_sys::uevent;
+use skyward_sys::Power;
 use skyward_systems::Who;
 use skyward_ui::app::{
-    App, Asked, BackupAt, BackupEnd, BackupEntry, BackupRefusal, ClashChoice, Data, DownloadEnd, Effect, EraseStop, FileKind, FileOp,
-    FileRow, FileTask, FsAction, FsRow, Have, Held, ItemEnd, ItemState, JobEnd, Keys, MountFailure, Part, PartKind, PartStop, Place,
-    RenameRefused, Screen, Shot, SkywardEnd, SkywardStage, Target, UsbDrive, UsbLink, Wipe, DATA_OPENING, DATA_PARTITION, DOWNLOADS,
-    INSTALL_UNFINISHED, USB_DRIVE,
+    App, Asked, BackupAt, BackupEnd, BackupEntry, BackupRefusal, ClashChoice, Data, DownloadEnd, Effect, EraseStop, FileKind, FileOp, FileRow, FileTask,
+    FsAction, FsRow, Have, Held, ItemEnd, ItemState, JobEnd, Keys, MountFailure, Part, PartKind, PartStop, Place, RenameRefused, Screen, Shot, SkywardEnd,
+    SkywardStage, Target, UsbDrive, UsbLink, Wipe, DATA_OPENING, DATA_PARTITION, DOWNLOADS, INSTALL_UNFINISHED, NO_SHARED_STORAGE, USB_DRIVE,
 };
 use skyward_ui::settings::Keeper;
-use skyward_ui::surface::kms::KmsSurface;
+use skyward_ui::surface::Display;
 use skyward_ui::{Canvas, Fonts, Lang, Surface};
 use skyward_vab::{Merge, Standing};
 use std::collections::{BTreeSet, VecDeque};
@@ -91,18 +90,28 @@ struct Backlight {
 
 impl Backlight {
     fn open() -> Result<Self> {
-        let mut dirs: Vec<PathBuf> = fs::read_dir("/sys/class/backlight")
-            .context("read /sys/class/backlight")?
-            .map(|e| e.map(|e| e.path()))
-            .collect::<std::io::Result<_>>()?;
-        dirs.sort();
-        // Qualcomm panels expose panel0-backlight; take it when present.
-        let dir = dirs
-            .iter()
-            .find(|d| d.file_name().is_some_and(|n| n == "panel0-backlight"))
-            .or(dirs.first())
-            .ok_or_else(|| anyhow!("no backlight device"))?
-            .clone();
+        // Kernels that light the panel through an fbdev rather than KMS name
+        // it in the LED class instead, where a phone of this generation puts
+        // lcd-backlight.
+        let mut found: Vec<(bool, PathBuf)> = Vec::new();
+        for class in ["/sys/class/backlight", "/sys/class/leds"] {
+            let panel_class = class.ends_with("backlight");
+            if let Ok(read) = fs::read_dir(class) {
+                for entry in read.flatten() {
+                    found.push((panel_class, entry.path()));
+                }
+            }
+        }
+        found.sort_by_key(|(_, at)| at.clone());
+        let named = |want: &str| found.iter().find(|(_, at)| at.file_name().is_some_and(|n| n == want)).map(|(_, at)| at.clone());
+        // Qualcomm panels expose panel0-backlight, and a phone lit through an
+        // fbdev exposes lcd-backlight among the LED class' flash, torch and
+        // button lights; failing both names, only the backlight class holds a
+        // device that is the panel's own, so nothing else is taken.
+        let dir = named("panel0-backlight")
+            .or_else(|| named("lcd-backlight"))
+            .or_else(|| found.iter().find(|(panel, _)| *panel).map(|(_, at)| at.clone()))
+            .ok_or_else(|| anyhow!("no backlight device in /sys/class/backlight"))?;
         let read = |name: &str| -> Result<u32> {
             fs::read_to_string(dir.join(name))
                 .with_context(|| format!("read {}/{name}", dir.display()))?
@@ -149,6 +158,12 @@ const NORMAL_MAX: [(&str, &str); 3] = [
 /// display driver booted with gives that maximum in the device tree.
 fn normal_max(max: u32) -> Result<u32> {
     let param = "/sys/module/msm_drm/parameters/dsi_display0";
+    // A panel lit through an fbdev rather than DRM names no boot parameter
+    // like this and keeps no brightness above what its own class gives: the
+    // maximum it reports is the range it is run at, so that is the answer.
+    if !Path::new(param).exists() {
+        return Ok(max);
+    }
     let boot = fs::read_to_string(param).with_context(|| format!("read {param}"))?;
     // The panel's node, then its configuration after a colon, as in
     // "qcom,mdss_dsi_m1_42_02_0a_dsc_cmd:"; the driver takes no name
@@ -219,8 +234,21 @@ impl Transfer {
     /// goes on.
     fn offer(&mut self, offer: bool, lang: Lang) -> Result<()> {
         if offer != self.offered {
-            let description = skyward_ui::fmt::storage_name(lang).into();
-            let storage = offer.then(|| skyward_mtp::Storage { top: PathBuf::from(skyward_crypto::data::SDCARD), description });
+            let description: String = skyward_ui::fmt::storage_name(lang).into();
+            // What the computer is shown is the folder the phone's own
+            // system keeps its users' files in, not the `/sdcard` link made
+            // for it: where that link was not made, the files are still
+            // there, and a file transfer that shows a folder of the
+            // recovery's ramdisk in their place is the worse of the two.
+            let top = skyward_crypto::data::shared_storage().unwrap_or_else(|| PathBuf::from(skyward_crypto::data::SDCARD));
+            let storage = offer.then(|| skyward_mtp::Storage { top: top.clone(), description: description.clone() });
+            skyward_sys::kmsg(&format!(
+                "file transfer {}",
+                match &storage {
+                    Some(one) => format!("offers {}", one.top.display()),
+                    None => "took its storage back".into(),
+                }
+            ))?;
             self.service.offer(storage)?;
             self.offered = offer;
         }
@@ -430,14 +458,7 @@ fn backups_at(place: Place) -> Result<Vec<BackupEntry>> {
 
 /// What a backup's manifest records, as the pages show it.
 fn held(m: &skyward_backup::Manifest) -> Held {
-    Held {
-        made: m.made,
-        size: m.size(),
-        parts: m.parts(),
-        device: m.device.clone(),
-        system: m.system.clone(),
-        slot: skyward_vab::Slot::from_suffix(&m.slot),
-    }
+    Held { made: m.made, size: m.size(), names: m.names(), device: m.device.clone(), system: m.system.clone(), slot: skyward_vab::Slot::from_suffix(&m.slot) }
 }
 
 /// Look for backups in the places asked, the restore page showing what is
@@ -474,9 +495,7 @@ fn delete_backup(place: Place, folder: &Path) -> Result<()> {
 /// How backing up or restoring ended, as its page tells it.
 fn backup_end(end: backup::End) -> BackupEnd {
     match end {
-        backup::End::Saved(folder) => {
-            BackupEnd::Saved(folder.file_name().expect("a backup's folder has a name").to_string_lossy().into_owned())
-        }
+        backup::End::Saved(folder) => BackupEnd::Saved(folder.file_name().expect("a backup's folder has a name").to_string_lossy().into_owned()),
         backup::End::Restored { unmade } => BackupEnd::Restored { unmade: unmade.iter().map(|p| p.display().to_string()).collect() },
         backup::End::Stopped => BackupEnd::Stopped,
         backup::End::Refused(refusal) => BackupEnd::Refused(match refusal {
@@ -587,6 +606,8 @@ fn part(step: Step) -> Part {
         Step::Data => Part::Data,
         Step::Cache => Part::Cache,
         Step::Metadata => Part::Metadata,
+        Step::System => Part::System,
+        Step::Vendor => Part::Vendor,
         Step::AppData => Part::AppData,
         Step::Media => Part::Media,
         Step::AppCaches => Part::AppCaches,
@@ -619,10 +640,39 @@ fn erase_stop(stop: wipe::Stop) -> EraseStop {
         wipe::Stop::Refused(wipe::Refusal::Update(hold)) => EraseStop::Update(hold),
         wipe::Stop::Refused(wipe::Refusal::NotRebuilt) => EraseStop::NotRebuilt,
         wipe::Stop::Refused(wipe::Refusal::NoCache) => EraseStop::NoCache,
+        wipe::Stop::Refused(wipe::Refusal::NoMetadata) => EraseStop::NoMetadata,
+        wipe::Stop::Refused(wipe::Refusal::NoPartition(name)) => EraseStop::NoPartition(name.to_string()),
         wipe::Stop::Closed(why) => EraseStop::Closed(why),
         wipe::Stop::Locked(users) => EraseStop::Locked(users),
         wipe::Stop::Failed(step, e) => EraseStop::Failed(part(step), format!("{e:#}")),
     }
+}
+
+/// The partition a row of the wipe page names, as the wipe itself takes it.
+fn step_of(part: Part) -> Result<Step> {
+    Ok(match part {
+        Part::Data => Step::Data,
+        Part::Cache => Step::Cache,
+        Part::Metadata => Step::Metadata,
+        Part::System => Step::System,
+        Part::Vendor => Step::Vendor,
+        other => anyhow::bail!("{other:?} is a part of the data partition, not a partition"),
+    })
+}
+
+/// Make the partitions the page has chosen afresh, one after another, its
+/// page following all of them.
+fn format_parts(app: &mut App, parts: &[Part]) -> Result<Eraser> {
+    let steps: Vec<Step> = parts.iter().copied().map(step_of).collect::<Result<_>>()?;
+    let formatting = match wipe::format_all(&steps) {
+        Ok(formatting) => formatting,
+        Err(stop) => {
+            app.erase_started(false, false, Vec::new());
+            return Eraser::stopped(stop);
+        }
+    };
+    app.erase_started(false, false, parts.to_vec());
+    Eraser::start(move |tell| formatting.carry_out(tell))
 }
 
 /// Start erasing all user data, its page following it; why it cannot
@@ -738,52 +788,103 @@ fn part_stop(stop: partwork::Stop) -> PartStop {
     }
 }
 
+/// The places a partition the page works on is mounted where the phone's
+/// table has it, tried in order; a name the table gives at none of them
+/// is not one the page lists.
+fn fs_points(name: &str) -> &'static [&'static str] {
+    match name {
+        DATA_PARTITION => &["/data"],
+        "metadata" => &["/metadata"],
+        "cache" => &["/cache"],
+        "system" => &["/system", "/system_root", "/"],
+        // Where a phone's table mounts the vendor files: /vendor on the Mi 6,
+        // /cust on the Mi MIX 2, whose recovery.fstab names the partition
+        // after itself.
+        "vendor" => &["/vendor", "/cust"],
+        _ => &[],
+    }
+}
+
 /// The partitions the filesystem page lists, in this order, where the
-/// phone's table has them: the data partition, /metadata and the cache
-/// partition. Each comes with what it holds now, its size, and the other
-/// filesystems the table lists for it that the recovery makes. The data
-/// partition reads only through its decryption, so what it holds is known
-/// only once it is open; until then, any of the table's filesystems may be
-/// it, and where the table lists one, it is that. /metadata keeps the key
-/// the data partition opens with, which making it afresh would lose, so it
-/// is offered no other.
-fn read_filesystems() -> Result<Vec<FsRow>> {
+/// phone's table has them: the data partition, /metadata, the cache
+/// partition, and, where the phone has one set of partitions, the system
+/// and vendor ones — a super's system and vendor are not partitions of
+/// their own to work a filesystem on. Each comes with what it holds now,
+/// its size, and the other filesystems the table lists for it that the
+/// recovery makes. The data partition reads only through its decryption,
+/// so what it holds is known only once it is open; until then, any of the
+/// table's filesystems may be it, and where the table lists one, it is
+/// that. /metadata keeps the key the data partition opens with, which
+/// making it afresh would lose, so it is offered no other.
+fn read_filesystems(a_b: bool) -> Result<Vec<FsRow>> {
+    let mut names = vec![DATA_PARTITION, "metadata", "cache"];
+    if !a_b {
+        names.push("system");
+        names.push("vendor");
+    }
     let mut rows = Vec::new();
-    for (name, point) in [(DATA_PARTITION, "/data"), ("metadata", "/metadata"), ("cache", "/cache")] {
-        let entries = fstab::read(point)?;
-        let Some(entry) = entries.first() else { continue };
-        let device = fstab::device(entry)?;
-        let size = skyward_block::size_bytes(&device)?;
-        let mut listed: Vec<String> = Vec::new();
-        for e in &entries {
-            if REFORMATS.contains(&e.filesystem.as_str()) && !listed.contains(&e.filesystem) {
-                listed.push(e.filesystem.clone());
-            }
+    for name in names {
+        // One partition this recovery cannot read is one row the page
+        // leaves out, not a page that says nothing: the others can still be
+        // worked on, and why this one went missing goes to the kernel log.
+        match filesystem_row(name) {
+            Ok(Some(row)) => rows.push(row),
+            Ok(None) => {}
+            Err(e) => skyward_sys::kmsg(&format!("the filesystem page leaves {name} out: {e:#}"))?,
         }
-        let filesystem = match name {
-            DATA_PARTITION => mount::visible(Path::new(point))?.map(|v| v.filesystem),
-            _ => probe::filesystem(Path::new(&device))?,
-        };
-        let others = match (name, &filesystem) {
-            ("metadata", _) => Vec::new(),
-            (_, Some(held)) => listed.into_iter().filter(|fs| fs != held).collect(),
-            (_, None) if listed.len() > 1 => listed,
-            (_, None) => Vec::new(),
-        };
-        rows.push(FsRow { name: name.to_string(), mount_point: point.to_string(), filesystem, size, others });
     }
     Ok(rows)
 }
 
+/// The page's row for the partition `name`, or none where the phone's table
+/// has no line for it.
+fn filesystem_row(name: &str) -> Result<Option<FsRow>> {
+    let mut entries = Vec::new();
+    let mut point = "";
+    for one in fs_points(name) {
+        let found = fstab::read(one)?;
+        if !found.is_empty() {
+            entries = found;
+            point = *one;
+            break;
+        }
+    }
+    let Some(entry) = entries.first() else {
+        return Ok(None);
+    };
+    let device = fstab::device(entry)?;
+    let size = skyward_block::size_bytes(&device)?;
+    let mut listed: Vec<String> = Vec::new();
+    for e in &entries {
+        if REFORMATS.contains(&e.filesystem.as_str()) && !listed.contains(&e.filesystem) {
+            listed.push(e.filesystem.clone());
+        }
+    }
+    let filesystem = match name {
+        DATA_PARTITION => mount::visible(Path::new(point))?.map(|v| v.filesystem),
+        _ => probe::filesystem(Path::new(&device))?,
+    };
+    let others = match (name, &filesystem) {
+        ("metadata", _) => Vec::new(),
+        (_, Some(held)) => listed.into_iter().filter(|fs| fs != held).collect(),
+        (_, None) if listed.len() > 1 => listed,
+        (_, None) => Vec::new(),
+    };
+    Ok(Some(FsRow { name: name.to_string(), mount_point: point.to_string(), filesystem, size, others }))
+}
+
 /// The filesystem page's partition `name` for its work: the data partition,
-/// or the table's first entry for another.
+/// or the table's first entry where the name's own place is mounted.
 fn fs_part(name: &str) -> Result<partwork::Part> {
     if name == DATA_PARTITION {
         return Ok(partwork::Part::Data);
     }
-    let point = format!("/{name}");
-    let entry = fstab::read(&point)?.into_iter().next().with_context(|| format!("the phone's table has no {point}"))?;
-    Ok(partwork::Part::Entry(entry))
+    for point in fs_points(name) {
+        if let Some(entry) = fstab::read(point)?.into_iter().next() {
+            return Ok(partwork::Part::Entry(entry));
+        }
+    }
+    Err(anyhow!("the phone's table has no {name} partition to work on"))
 }
 
 /// What the pages act on: a touch or a key, what a program asked on the
@@ -904,7 +1005,12 @@ fn read_folder(path: &Path) -> Result<Vec<FileRow>> {
 /// are started again from there whenever they end.
 fn read_mounts(services: &[Service]) -> Result<Vec<skyward_ui::app::MountRow>> {
     use skyward_ui::app::MountRow;
-    let slot = skyward_vab::current_slot()?.context("not an A/B phone")?;
+    // A phone with one set of partitions is read off its own table, which
+    // names every partition and where it goes; only a phone with two has a
+    // slot to ask boot control about.
+    let Some(slot) = skyward_vab::current_slot()? else {
+        return single_set_mounts();
+    };
     let shown = skyward_vab::mounted_partitions(slot)?;
     let holders = skyward_block::mount::holders()?;
     let props = skyward_info::installed_props(slot)?;
@@ -922,12 +1028,31 @@ fn read_mounts(services: &[Service]) -> Result<Vec<skyward_ui::app::MountRow>> {
                 using.insert(program.to_string_lossy().into_owned());
             }
         }
-        rows.push(MountRow {
-            base,
-            point: point.display().to_string(),
-            mounted: mounted.is_some(),
-            holders: using.into_iter().collect(),
-        });
+        rows.push(MountRow { base, point: point.display().to_string(), mounted: mounted.is_some(), holders: using.into_iter().collect() });
+    }
+    Ok(rows)
+}
+
+/// The partitions of a phone with one set of them, as its own table names
+/// them: where each goes, whether it is on now, and which programs hold it.
+/// The services are not asked about here, since what they run from is told by
+/// the slot a phone of one set has no answer to give.
+fn single_set_mounts() -> Result<Vec<skyward_ui::app::MountRow>> {
+    use skyward_ui::app::MountRow;
+    let holders = mount::holders()?;
+    let mut rows = Vec::new();
+    for one in fstab::mountable()? {
+        let at = Path::new(&one.point);
+        let mounted = mount::is_mount_point(at)?;
+        let mut using = BTreeSet::new();
+        if mounted {
+            // The table reaches the storage controller by a path a recovery
+            // need not have, so what holds the partition is looked up by the
+            // device that is really there.
+            let device = fstab::device(&one.ways[0])?;
+            using.extend(holders.get(&skyward_block::devnum(&device)?).into_iter().flatten().cloned());
+        }
+        rows.push(MountRow { base: one.name, point: one.point, mounted, holders: using.into_iter().collect() });
     }
     Ok(rows)
 }
@@ -967,11 +1092,36 @@ fn set_slot(slot: skyward_vab::Slot) -> Result<skyward_vab::BootSlots, String> {
 /// and the booted slot's partitions come off.
 fn detach(services: Vec<Service>) -> Detach {
     Box::new(move || {
-        let slot = skyward_vab::current_slot()?.context("not an A/B phone")?;
+        let Some(slot) = skyward_vab::current_slot()? else {
+            return unmount_system();
+        };
         let mounted = skyward_vab::mounted_partitions(slot)?;
         let busy = services::pin(&services, &mounted)?;
         skyward_vab::release_partitions(slot, &busy)
     })
+}
+
+/// Before an update writes over the partitions of a phone that keeps one set
+/// of them, whatever the recovery has mounted from those partitions comes
+/// off — the data partition and the storage shown from it aside, since the
+/// update is read from there. A partition something is still running from
+/// answers busy, and that is told as what it is.
+fn unmount_system() -> Result<()> {
+    for point in crate::backup::system_points()? {
+        let at = Path::new(&point);
+        if !mount::is_mount_point(at)? {
+            continue;
+        }
+        mount::umount(at).with_context(|| format!("{point} is in use"))?;
+    }
+    // A retrofit ROM installer may rewrite super's partition table. Release
+    // the mappings made for the pages and backups before handing it over.
+    for partition in fstab::mountable()? {
+        if partition.ways.iter().any(|entry| entry.extras.iter().any(|flag| flag == "logical")) && skyward_block::dm::status(&partition.name)?.is_some() {
+            skyward_block::dm::remove(&partition.name)?;
+        }
+    }
+    Ok(())
 }
 
 /// What an install does besides installing, as the install page's switches
@@ -981,6 +1131,13 @@ fn detach(services: Vec<Service>) -> Detach {
 fn install_options(app: &App) -> Options {
     Options { keep: app.state.keep_recovery && app.state.recovery_partitions, signed: app.state.check_signature }
 }
+
+/// When, after the panel is taken over or woken, the touchscreen is told
+/// again. The panel's own power cycle leaves the controller of some phones
+/// — the Mi MIX 2's among them — reporting nothing until it is reset, and a
+/// reset written while it is still settling is lost, so it is asked more
+/// than once over the seconds that follow.
+const TOUCH_AGAIN: [Duration; 3] = [Duration::from_millis(1500), Duration::from_millis(4000), Duration::from_millis(8000)];
 
 /// How often the WLAN page scans while it shows.
 const SCAN_EVERY: Duration = Duration::from_secs(10);
@@ -1046,20 +1203,36 @@ fn wait(fds: &[i32], timeout_ms: i32) -> Result<()> {
 /// Run the pages. What `request`, read from misc, asks for decides the
 /// first of them; asking for nothing, they start at `start`.
 pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, start: Screen, dump: Option<&Path>) -> Result<()> {
-    if cfg.display.density == 0 {
-        return Err(anyhow!("{}: [display] density is required to lay out the UI", cfg.device.codename));
-    }
     let mut info = skyward_info::collect(cfg)?;
     let fonts = Fonts::load(font, 0, mono)?;
-    let mut surface = KmsSurface::open("/dev/dri/card0")?;
+    let mut surface = Display::open()?;
     let (w, h) = surface.size();
+    // A unified recovery uses the panel's actual dimensions. Prefer the
+    // device's density property; otherwise lay out a 360 dp short edge.
+    let density = if cfg.display.density == 0 {
+        skyward_sys::prop("ro.sf.lcd_density")
+            .and_then(|v| v.parse::<u32>().ok())
+            .filter(|v| (120..=640).contains(v))
+            .unwrap_or((w.min(h) * 160 / 360).clamp(160, 640))
+    } else {
+        cfg.display.density
+    };
     eprintln!("display {}", surface.describe());
     let mut inputs = Inputs::open(w, h, cfg.touch.writes.clone())?;
     let started = Instant::now();
     let mut touch_known = false;
     // adbd and fastbootd ask over it to go over to fastboot and back.
     let control = Control::open()?;
-    let mut haptics = cfg.haptics.as_ref().map(Haptics::open).transpose()?;
+    // A motor the configuration describes that this kernel does not offer
+    // is a recovery without clicks, not a recovery that cannot start: the
+    // screen, the touches and the partitions are all asked for after this.
+    let mut haptics = match cfg.haptics.as_ref().map(Haptics::open).transpose() {
+        Ok(haptics) => haptics,
+        Err(e) => {
+            skyward_sys::kmsg(&format!("the vibration motor is left out: {e:#}"))?;
+            None
+        }
+    };
     let mut backlight = Backlight::open()?;
     let first = match &request.work {
         Work::Fastboot => Screen::Fastboot,
@@ -1077,7 +1250,7 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
         | Work::SwitchSystem { .. }
         | Work::SystemStopped => start,
     };
-    let mut app = App::new(first, w, h, cfg.display.density as f32 / 160.0);
+    let mut app = App::new(first, w, h, density as f32 / 160.0);
     app.set_screen_corners(cfg.display.corner_radius as f32);
     // The settings kept from the starts before are back before the first
     // frame, and before file transfer starts with its switch and the time
@@ -1087,6 +1260,10 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
     let kept = settings::read()?;
     let locale = request.locale.as_deref().or(info.locale.as_deref());
     let named = locale.map(Lang::for_locale).transpose()?;
+    // What a backup can take here, offered before the saved choice is read
+    // back over it: a name the phone does not have is not ticked, and one it
+    // has is left as the last start chose it.
+    app.set_backup_of(backup::choices(&cfg.backup.efs, &cfg.backup.partitions)?.into_iter().map(|choice| (choice.name, choice.hint)).collect());
     app.take_settings(kept.settings(), named);
     let mut keeper = Keeper::new(&kept);
     skyward_sys::kmsg(&format!(
@@ -1124,6 +1301,13 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
     // Whether the panel's frame memory has been blacked out for an off
     // panel; cleared once a real frame is shown again.
     let mut blanked = false;
+    // Whether the touchscreen's own knobs have been set since the panel was
+    // last power cycled. The first frame takes the panel over and every wake
+    // cycles it, and both hand the driver's wake gesture back on.
+    let mut told_touch = false;
+    // When that was, and how many of TOUCH_AGAIN have been done since.
+    let mut touch_since: Option<Instant> = None;
+    let mut touch_again = 0;
     // When the panel gone dark began to rest.
     let mut rested_at: Option<Instant> = None;
     // Started for fastboot, the port goes to the phone's own fastbootd. The
@@ -1166,6 +1350,43 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
         Ok(cache) => cache.is_some(),
         Err(e) => {
             skyward_sys::kmsg(&format!("whether the phone has a cache partition is not known: {e:#}"))?;
+            false
+        }
+    };
+    // The same for /metadata, which older phones and this one do not have
+    // a partition for at all.
+    // Which partitions this phone can be formatted by, in the order its
+    // own configuration asks for: a row is only offered where the phone's
+    // table has a line for it, and a configuration that names none leaves
+    // every one of them offered, as far as the phone has it.
+    let wanted: Vec<&str> =
+        if cfg.wipe.formats.is_empty() { vec!["data", "cache", "metadata", "system", "vendor"] } else { cfg.wipe.formats.iter().map(String::as_str).collect() };
+    let mut formats: Vec<Part> = Vec::new();
+    for name in wanted {
+        let step = match name {
+            "data" => Step::Data,
+            "cache" => Step::Cache,
+            "metadata" => Step::Metadata,
+            "system" => Step::System,
+            "vendor" => Step::Vendor,
+            other => {
+                skyward_sys::kmsg(&format!("the configuration asks to format {other}, which is no partition this page knows"))?;
+                continue;
+            }
+        };
+        match wipe::has(step) {
+            Ok(true) => formats.push(part(step)),
+            Ok(false) => {}
+            Err(e) => {
+                skyward_sys::kmsg(&format!("whether the phone has a {name} partition to format is not known: {e:#}"))?;
+            }
+        }
+    }
+    app.state.formats = formats;
+    app.state.metadata_partition = match wipe::metadata() {
+        Ok(entry) => entry.is_some(),
+        Err(e) => {
+            skyward_sys::kmsg(&format!("whether the phone has a metadata partition is not known: {e:#}"))?;
             false
         }
     };
@@ -1355,6 +1576,9 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
         None => None,
     };
     let mut scanned_at = Instant::now();
+    // Whether this phone has a second set of partitions at all, which is what
+    // decides where an update can be read, merged or searched for.
+    app.state.slots = info.slot.is_some();
     app.state.update_server = cfg.update.is_some();
     // Asking the update server, and downloading the full package.
     let mut checker: Option<updates::Worker> = None;
@@ -1363,7 +1587,15 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
     let mut skyward_checker: Option<updates::Worker> = None;
     let mut skyward_updater: Option<updates::Worker> = None;
     // The phone sleeps while its screen is off and nothing needs it awake.
-    let sleeper = Sleeper::start()?;
+    // A phone that cannot sleep still works, and only its battery pays for
+    // it, so why the sleeper did not start goes to the kernel log.
+    let sleeper = match Sleeper::start() {
+        Ok(s) => Some(s),
+        Err(e) => {
+            skyward_sys::kmsg(&format!("the phone will not sleep: {e:#}"))?;
+            None
+        }
+    };
     // A uevent may be a charger or a computer attached or taken away: the
     // battery is read at once, and the phone stays awake until it is.
     let uevents = uevent::Listener::open()?;
@@ -1443,10 +1675,23 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
         let mut shown = false;
         if panel.is_some() {
             // A display turned off comes on again with a frame drawn for it.
-            if app.take_dirty() || !surface.is_on() {
+            let waking = !surface.is_on();
+            if app.take_dirty() || waking {
                 let t0 = Instant::now();
                 app.compose(&mut screen, &fonts, &info, &shown_clock, now);
                 surface.present(&screen)?;
+                // The first frame is the one that takes the panel over, and
+                // every wake after it cycles the panel again. Both hand the
+                // touch controller's wake gesture back on, and while it is on
+                // a controller such as the Mi MIX 2's reports a touch as a
+                // wake-up rather than as input, so what the device
+                // configuration writes to the touchscreen is written again.
+                if waking || !told_touch {
+                    inputs.tell_panel_again()?;
+                    told_touch = true;
+                    touch_since = Some(Instant::now());
+                    touch_again = 0;
+                }
                 eprintln!("frame {:?} in {} ms", app.screen(), t0.elapsed().as_millis());
                 if let Some(path) = dump {
                     fs::write(path, &screen.data).with_context(|| format!("write {}", path.display()))?;
@@ -1454,6 +1699,16 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
                 shown = true;
             }
             blanked = false;
+            // A controller woken by the panel's own power cycle is not
+            // listening for a moment after it, and a write made then is
+            // lost: what the configuration says is said again over the next
+            // seconds, as many times as TOUCH_AGAIN allows.
+            if let Some(since) = touch_since {
+                while touch_again < TOUCH_AGAIN.len() && since.elapsed() >= TOUCH_AGAIN[touch_again] {
+                    inputs.tell_panel_again()?;
+                    touch_again += 1;
+                }
+            }
         } else if !blanked {
             // Black out the panel's frame memory before the backlight goes
             // to 0 and the display off, so an OLED that floors the backlight
@@ -1530,8 +1785,13 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
             && !running
             && asked.is_none()
             && usb_link()? != UsbLink::Connected;
-        sleeper.allow(may_sleep);
-        let mut fds = vec![inputs.fd(), uevents.fd(), sleeper.fd()];
+        if let Some(s) = &sleeper {
+            s.allow(may_sleep);
+        }
+        let mut fds = vec![inputs.fd(), uevents.fd()];
+        if let Some(s) = &sleeper {
+            fds.push(s.fd());
+        }
         if let Some(i) = &installer {
             fds.push(i.fd());
         }
@@ -1583,7 +1843,7 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
         fds.push(readings.fd());
         wait(&fds, timeout)?;
         let now = monotonic_ms();
-        for slept in sleeper.slept() {
+        for slept in sleeper.as_ref().map(Sleeper::slept).unwrap_or_default() {
             match slept {
                 Slept::Woke => skyward_sys::kmsg("the phone slept and woke")?,
                 Slept::Refused(why) => skyward_sys::kmsg(&format!("the phone did not sleep: {why}"))?,
@@ -2013,13 +2273,17 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
                             updates::End::Failed(why) => SkywardEnd::Download(why),
                             updates::End::NotWritten(why) => SkywardEnd::NotWritten(why),
                             updates::End::WriteFailed(slots, why) => SkywardEnd::WriteFailed(slots, why),
-                            updates::End::Downloaded => unreachable!("Skyward's build is written once it is downloaded"),
+                            updates::End::Downloaded => {
+                                unreachable!("Skyward's build is written once it is downloaded")
+                            }
                         };
                         skyward_sys::kmsg(&format!("updating Skyward ended: {end:?}"))?;
                         app.skyward_ended(end, now);
                         updated = true;
                     }
-                    updates::Event::Checked(_) | updates::Event::SkywardChecked(_) => unreachable!("an update asks nothing of its own"),
+                    updates::Event::Checked(_) | updates::Event::SkywardChecked(_) => {
+                        unreachable!("an update asks nothing of its own")
+                    }
                 }
             }
         }
@@ -2171,6 +2435,19 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
                             eraser = Some(parts_wipe(&mut app, steps, &cfg.wipe.logs, false, None)?);
                         }
                     }
+                    Effect::Format(parts) => {
+                        ensure!(eraser.is_none(), "erasing is under way already");
+                        ensure!(!parts.is_empty(), "no partition was chosen to make afresh");
+                        if decryptor.is_some() {
+                            app.report(app.state.lang.pick(DATA_OPENING), now);
+                            continue;
+                        }
+                        if !withhold(&mut transfer, &mut app, now)? {
+                            continue;
+                        }
+                        erase_leaves = false;
+                        eraser = Some(format_parts(&mut app, &parts)?);
+                    }
                     Effect::Install => installer.as_ref().context("no installer holds an update")?.install(),
                     // A shell that will not start, or will not take keys,
                     // is the page's to report; the recovery carries on.
@@ -2249,8 +2526,15 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
                         installer = Some(Installer::open(PathBuf::from(path), detach(cfg.services.clone()), install_options(&app))?);
                     }
                     Effect::Flash { partition, pick } => {
-                        let slot = skyward_vab::current_slot()?.context("not an A/B phone")?;
-                        installer.as_ref().context("no installer holds an image")?.flash(partition, pick.slots(slot));
+                        // A phone with one set of partitions has no slot to
+                        // choose: its image goes to the partition it is
+                        // named for.
+                        let dir = Path::new(skyward_block::BY_NAME);
+                        let devices = match skyward_vab::current_slot()? {
+                            Some(slot) => pick.slots(slot).iter().map(|&slot| skyward_install::image::device(dir, partition, slot)).collect(),
+                            None => vec![skyward_install::image::bare(dir, partition)],
+                        };
+                        installer.as_ref().context("no installer holds an image")?.flash(partition, devices);
                     }
                     Effect::Cancel => match &installer {
                         Some(i) => i.cancel()?,
@@ -2299,7 +2583,17 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
                     }
                     Effect::Unlock { user, code } => {
                         ensure!(decryptor.is_none(), "the data partition is being opened already");
-                        let job = decrypt::Job::Unlock { closed: closed.clone(), user, credential: code.into_bytes() };
+                        // **What the page handed over, in the kernel log while
+                        // this is being worked out.** A pattern is the dots
+                        // themselves, each numbered from nought, and whether
+                        // the page hands those over or the numbers drawn on
+                        // them is the whole of what a phone that will not open
+                        // leaves to go on. Only a short run of dots is written
+                        // down: anything that could be a password is not.
+                        if !code.is_empty() && code.len() <= 9 && code.iter().all(|b| *b < 9) {
+                            skyward_sys::kmsg(&format!("user {user}'s pattern is {} dots: {code:02x?}", code.len()))?;
+                        }
+                        let job = decrypt::Job::Unlock { closed: closed.clone(), user, credential: code };
                         decryptor = Some(Decryptor::start(job)?);
                     }
                     Effect::ReadDir(folder) => list(&mut app, folder)?,
@@ -2362,7 +2656,7 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
                     }
                     Effect::StopRelabel => relabeler.as_ref().context("there is no relabeling to stop")?.stop(),
                     // Partitions that cannot be read are the page's to say.
-                    Effect::ReadFilesystems => app.set_filesystems(read_filesystems().map_err(|e| format!("{e:#}"))),
+                    Effect::ReadFilesystems => app.set_filesystems(read_filesystems(info.slot.is_some()).map_err(|e| format!("{e:#}"))),
                     // The data partition made afresh as another filesystem
                     // is a factory reset, as the system asks for one; the
                     // rest is work on one partition. Opening the data
@@ -2399,6 +2693,18 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
                             app.report(app.state.lang.pick(INSTALL_UNFINISHED), now);
                             continue;
                         }
+                        // Shared storage is the system's own doing: a data
+                        // partition made afresh holds none until that system
+                        // has started once. What /sdcard is meanwhile is a
+                        // folder of this recovery's ramdisk, a few megabytes
+                        // of it, and no whole partition's image goes there.
+                        // The room check would answer with two byte counts
+                        // and no reason, so the reason is said first.
+                        if place == Place::Storage && !mount::is_mount_point(Path::new(skyward_crypto::data::SDCARD))? {
+                            skyward_sys::kmsg(&format!("no backup: {} is not the phone's shared storage", skyward_crypto::data::SDCARD))?;
+                            app.report(app.state.lang.pick(NO_SHARED_STORAGE), now);
+                            continue;
+                        }
                         let into = backups_in(place);
                         let there = into.ancestors().find(|p| p.exists()).context("the root is always there")?;
                         let ownership = match ownership(there) {
@@ -2410,7 +2716,8 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
                         };
                         let made = unix_now()?;
                         let task = backup::BackupTask {
-                            parts,
+                            chosen: parts,
+                            offered: cfg.backup.partitions.clone(),
                             stamp: skyward_ui::fmt::stamp(made, app.state.time_zone),
                             into,
                             ownership,
@@ -2434,7 +2741,7 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
                         }
                         let task = backup::RestoreTask {
                             folder: backups_in(place).join(&name),
-                            parts,
+                            chosen: parts,
                             device: cfg.device.codename.clone(),
                             skipped: backup::data_skipped(&cfg.backup.data_skipped),
                             detach: detach(cfg.services.clone()),
@@ -2449,7 +2756,16 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
                     }
                     Effect::StopBackup => backuper.as_ref().context("there is no backup or restore to stop")?.stop(),
                     Effect::ReadUpdate => {
-                        let slot = info.slot.context("only an A/B phone has an update to merge")?;
+                        // There is no other slot to read an update from here,
+                        // and a page this phone cannot answer is no reason to
+                        // end the recovery: this error used to take the whole
+                        // service down, and the restart that followed ran the
+                        // panel takeover again, which the screen showed as a
+                        // blackout. The page is told instead.
+                        let Some(slot) = info.slot else {
+                            eprintln!("this phone has one set of partitions: the update page has nothing to read");
+                            continue;
+                        };
                         // A merge followed tells where it stands itself.
                         if merger.is_none() {
                             app.set_update(skyward_vab::standing(slot)?);
@@ -2460,7 +2776,12 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
                     }
                     Effect::Merge => {
                         ensure!(merger.is_none(), "the update is being merged already");
-                        let slot = info.slot.context("only an A/B phone merges an update")?;
+                        // As reading the update: nothing to merge, said on
+                        // screen, and the recovery stays up.
+                        let Some(slot) = info.slot else {
+                            eprintln!("this phone has one set of partitions: there is no update to merge");
+                            continue;
+                        };
                         skyward_sys::kmsg("merging the update, as the update page asked")?;
                         merger = Some(merge::Merger::start(slot, true)?);
                     }
@@ -2480,9 +2801,7 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
                         let server = cfg.update.as_ref().context("the phone's update server is not known")?.server.clone();
                         let probe = cfg.wlan.as_ref().context("the phone's WLAN is not brought up")?.probe.clone();
                         match installed(cfg, &info) {
-                            Ok(installed) => {
-                                checker = Some(updates::Worker::start(updates::Task::Check { server, probe, installed }, servers.clone())?)
-                            }
+                            Ok(installed) => checker = Some(updates::Worker::start(updates::Task::Check { server, probe, installed }, servers.clone())?),
                             Err(e) => app.update_checked(Err(Unanswered::Failed(format!("{e:#}"))), Have::Nothing),
                         }
                     }
@@ -2559,15 +2878,24 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
                     // A partition that will not mount, or is in use, is the
                     // page's to report; the recovery carries on.
                     Effect::Mount(base) => {
-                        let slot = skyward_vab::current_slot()?.context("not an A/B phone")?;
-                        if let Err(e) = skyward_vab::mount_one(slot, &base) {
+                        // Where the phone has a slot, boot control and super
+                        // say what to put up; where it has one set of
+                        // partitions, its own table says the same on its own.
+                        let went = match skyward_vab::current_slot()? {
+                            Some(slot) => skyward_vab::mount_one(slot, &base).map(|_| ()),
+                            None => fstab::mount(&base).map(|_| ()),
+                        };
+                        if let Err(e) = went {
                             app.mount_failed(MountFailure { mounting: true, base, detail: format!("{e:#}") });
                         }
                         app.set_mounts(mounts());
                     }
                     Effect::Unmount(base) => {
-                        let slot = skyward_vab::current_slot()?.context("not an A/B phone")?;
-                        if let Err(e) = skyward_vab::unmount_one(slot, &base) {
+                        let went = match skyward_vab::current_slot()? {
+                            Some(slot) => skyward_vab::unmount_one(slot, &base),
+                            None => fstab::unmount(&base),
+                        };
+                        if let Err(e) = went {
                             app.mount_failed(MountFailure { mounting: false, base, detail: format!("{e:#}") });
                         }
                         app.set_mounts(mounts());
@@ -2576,8 +2904,7 @@ pub fn run(cfg: &DeviceConfig, font: &Path, mono: &Path, request: bcb::Request, 
                     // then the slot's partitions come up as at boot.
                     Effect::EnterRecovery => {
                         skyward_sys::usb::switch(skyward_sys::usb::resting(), USB_TIMEOUT)?;
-                        let slot = skyward_vab::current_slot()?.context("not an A/B phone")?;
-                        crate::prepare(cfg, slot)?;
+                        crate::prepare(cfg, skyward_vab::current_slot()?)?;
                         read_at = Instant::now();
                         info = skyward_info::collect(cfg)?;
                         fastboot = false;

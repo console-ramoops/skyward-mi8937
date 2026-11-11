@@ -15,6 +15,9 @@ mod filework;
 mod haptics;
 #[cfg(target_os = "android")]
 mod input;
+
+#[cfg(target_os = "android")]
+mod keyhal;
 #[cfg(target_os = "android")]
 mod merge;
 #[cfg(target_os = "android")]
@@ -79,6 +82,70 @@ enum Cmd {
     Reboot { target: String },
     /// Print the bootloader control block in misc.
     Bcb,
+    /// Open the data partition the way the decrypt page does, and say what
+    /// came of it: the whole chain — the key hardware, the key files, the
+    /// keys for the files — in one command.
+    Opendata {
+        /// Do the work on a thread of its own, the way the decrypt page
+        /// does, rather than on the thread that started the program.
+        #[arg(long)]
+        in_thread: bool,
+    },
+    /// Say how a folder says it is encrypted and whether the key it is kept
+    /// by is in, which is what tells a folder whose key was not let in from
+    /// one whose key was let in wrongly. With no folder named, the places
+    /// the data partition keeps its files.
+    #[cfg(target_os = "android")]
+    Pol { dirs: Vec<PathBuf> },
+    /// Let one of the phone's keys in by hand — the word in front of it and
+    /// the size after it of the caller's choosing — and say whether a
+    /// folder's names then read as words. The kernel takes a key only as
+    /// that whole structure and refuses anything else as though there were
+    /// no key at all, which reads exactly like a key never let in.
+    #[cfg(target_os = "android")]
+    Trykey {
+        /// The folder of key files to unwrap, as the phone keeps them.
+        #[arg(long, default_value = "/data/unencrypted/key")]
+        key: PathBuf,
+        /// The name to let it in under, in hex, where that is not the first
+        /// eight bytes of the key's own hash.
+        #[arg(long)]
+        name: Option<String>,
+        /// The word in front of the key: how the contents are encrypted, as
+        /// the kernel numbers it.
+        #[arg(long, default_value_t = 2)]
+        mode: u32,
+        /// How much of the key the word after it says is the key.
+        #[arg(long, default_value_t = 64)]
+        size: usize,
+        /// The folder to read afterwards.
+        dir: PathBuf,
+    },
+    /// Start the phone's key hardware service and ask it about itself,
+    /// which is the first thing to try when a key will not unwrap. With
+    /// `list`, print what the hardware directory holds instead.
+    Keytest {
+        /// Print the interfaces the hardware directory holds, rather than
+        /// asking the key service about itself.
+        #[arg(long)]
+        list: bool,
+        /// Load the key hardware into this process and ask it nothing at
+        /// all, which is how its C structures are checked against it.
+        #[arg(long)]
+        legacy: bool,
+        /// A file holding a key blob, to ask the hardware about.
+        #[arg(long)]
+        blob: Option<String>,
+        /// How many bytes of the file to leave out before the blob begins,
+        /// for a file that carries a word of its own in front of it.
+        #[arg(long, default_value_t = 0)]
+        skip: usize,
+        /// Have the hardware make a key of its own and show the blob it
+        /// keeps it in, which is what a blob written by someone else is
+        /// compared against.
+        #[arg(long)]
+        make: bool,
+    },
     /// Print the logical partition metadata in super.
     Lp {
         /// The super partition, or an image of its start.
@@ -172,7 +239,16 @@ enum Cmd {
     /// Say what the phone's credential service answers, which takes no
     /// credential and changes nothing.
     #[cfg(target_os = "android")]
-    Gatekeeper,
+    Gatekeeper {
+        /// A pattern to check against the phone's own record of the owner's
+        /// credential, in the numbers the phone draws its dots with: `12369`
+        /// for the pattern that goes 1, 2, 3, 6, 9. With it, every number a
+        /// credential may be enrolled under is tried, and the one that
+        /// recognises it is named — which is how a wrong credential is told
+        /// from a wrong guess at where it is enrolled.
+        #[arg(long)]
+        pattern: Option<String>,
+    },
     /// Say what the phone's weaver says of itself, which reads no slot and
     /// changes nothing.
     #[cfg(target_os = "android")]
@@ -187,9 +263,16 @@ enum Cmd {
         /// world, the same as a wrong try on the screen itself.
         #[arg(long)]
         credential: Option<String>,
+        /// A pattern's dots, in the order the finger joins them, as the
+        /// numbers the phone draws them with: `12369` for the pattern that
+        /// goes 1, 2, 3, 6, 9. A pattern is not text — the phone keeps the
+        /// dots themselves, each numbered from nought — so it cannot be
+        /// given as one.
+        #[arg(long, conflicts_with = "credential")]
+        pattern: Option<String>,
         /// Close the data partition instead, as a factory reset does before
         /// it erases it: every other program holding it ends first.
-        #[arg(long, conflicts_with = "credential")]
+        #[arg(long, conflicts_with_all = ["credential", "pattern"])]
         close: bool,
     },
     /// Drive the panel and touchscreen with the recovery UI.
@@ -240,6 +323,15 @@ fn main() -> Result<()> {
             let p = Power::parse(&target).ok_or_else(|| anyhow!("unknown target {target:?}"))?;
             skyward_sys::power(p)
         }
+        Cmd::Keytest { list, legacy, blob, skip, make } => keytest(list, legacy, blob, skip, make),
+        Cmd::Opendata { in_thread } => match in_thread {
+            true => std::thread::Builder::new().name("decrypt".into()).spawn(opendata)?.join().expect("the decrypting thread does not panic"),
+            false => opendata(),
+        },
+        #[cfg(target_os = "android")]
+        Cmd::Pol { dirs } => pol(dirs),
+        #[cfg(target_os = "android")]
+        Cmd::Trykey { key, name, mode, size, dir } => trykey(key, name, mode, size, dir),
         Cmd::Bcb => {
             let b = bcb::read(&bcb::misc())?;
             println!("command = {:?}", b.command);
@@ -350,7 +442,7 @@ fn main() -> Result<()> {
             Ok(())
         }
         #[cfg(target_os = "android")]
-        Cmd::Gatekeeper => {
+        Cmd::Gatekeeper { pattern } => {
             let (binder, hardware) = (skyward_binder::driver::Binder::open()?, skyward_binder::driver::Binder::hardware()?);
             let gatekeeper = skyward_crypto::gatekeeper::Gatekeeper::open(&binder, &hardware)?;
             println!("the credential service answers for {}", gatekeeper.serves()?);
@@ -366,6 +458,19 @@ fn main() -> Result<()> {
             match gatekeeper.verify(NOBODY, &[], &[]) {
                 Ok(_) => println!("it took a credential belonging to no one"),
                 Err(e) => println!("asked about a credential belonging to no one it says: {e:#}"),
+            }
+            if let Some(dots) = pattern {
+                // The phone keeps the dots themselves, numbered from the top
+                // left and from nought, in the order the finger joins them,
+                // and it enrols a user's credential a hundred thousand above
+                // their own number. What is said here is which reading of
+                // those numbers, and which way of turning them into a token,
+                // the secure world takes.
+                let typed = pattern_bytes(&dots)?;
+                println!("the pattern {dots} comes to {typed:02x?}");
+                for (how, took) in skyward_crypto::data::which_derivation(0, &typed, 100_000)? {
+                    println!("  {how}: {}", if took { "recognised" } else { "not recognised" });
+                }
             }
             Ok(())
         }
@@ -383,8 +488,14 @@ fn main() -> Result<()> {
             Ok(())
         }
         #[cfg(target_os = "android")]
-        Cmd::Data { credential, close: false } => {
+        Cmd::Data { credential, pattern, close: false } => {
             use skyward_crypto::data;
+            // What the user gave, as the phone keeps it.
+            let typed: Option<Vec<u8>> = match (&credential, &pattern) {
+                (Some(said), _) => Some(said.as_bytes().to_vec()),
+                (None, Some(dots)) => Some(pattern_bytes(dots)?),
+                (None, None) => None,
+            };
             let binder = skyward_binder::driver::Binder::open()?;
             let service = skyward_crypto::keymint::KeyMint::open(&binder)?;
             let opening = data::open_without_credential(&service)?;
@@ -400,8 +511,8 @@ fn main() -> Result<()> {
             }
             let mut closed = opening.closed;
             let asked = closed.iter().find(|c| !c.made_up).map(|c| c.user);
-            if let (Some(credential), Some(user)) = (&credential, asked) {
-                closed = data::unlock(&service, &closed, user, credential.as_bytes())?;
+            if let (Some(typed), Some(user)) = (&typed, asked) {
+                closed = data::unlock(&service, &closed, user, typed)?;
             }
             for c in &closed {
                 match &c.why {
@@ -435,10 +546,7 @@ fn lp(super_dev: &Path, slot: Option<u32>) -> Result<()> {
     let md = skyward_lp::read(super_dev, slot)?;
     let g = md.geometry;
     println!("slot {slot}: version {}.{}, flags {:#x}", md.major_version, md.minor_version, md.header_flags);
-    println!(
-        "geometry: {} metadata slots of {} bytes, logical block {} bytes",
-        g.metadata_slot_count, g.metadata_max_size, g.logical_block_size
-    );
+    println!("geometry: {} metadata slots of {} bytes, logical block {} bytes", g.metadata_slot_count, g.metadata_max_size, g.logical_block_size);
     for d in &md.damaged {
         println!("damaged: {d}");
     }
@@ -452,10 +560,7 @@ fn lp(super_dev: &Path, slot: Option<u32>) -> Result<()> {
         println!("group {}: max {} bytes", gr.name, gr.maximum_size);
     }
     for p in &md.partitions {
-        println!(
-            "partition {} group {} attributes {:#x}, {} bytes",
-            p.name, md.groups[p.group].name, p.attributes, p.bytes()
-        );
+        println!("partition {} group {} attributes {:#x}, {} bytes", p.name, md.groups[p.group].name, p.attributes, p.bytes());
         let mut start = 0;
         for e in &p.extents {
             let end = start + e.sectors() - 1;
@@ -557,8 +662,7 @@ fn hand_over(owners: &[skyward_config::Owners]) -> Result<usize> {
         let (uid, gid) = (id(&run.user)?, id(&run.group)?);
         for path in &run.paths {
             std::os::unix::fs::chown(path, Some(uid), Some(gid)).with_context(|| format!("give {path} to {}:{}", run.user, run.group))?;
-            std::fs::set_permissions(path, std::fs::Permissions::from_mode(run.mode))
-                .with_context(|| format!("give {path} the mode {:o}", run.mode))?;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(run.mode)).with_context(|| format!("give {path} the mode {:o}", run.mode))?;
             handed += 1;
         }
     }
@@ -691,11 +795,21 @@ fn recovery() -> Result<()> {
         skyward_sys::set_prop("sys.usb.config", "adb")?;
         let misc = bcb::misc();
         let message = bcb::read(&misc)?;
-        let request = message.request();
-        if !request.work.lasts() {
+        let mut request = message.request();
+        let cfg = DeviceConfig::load(Path::new("/").join(ramdisk::CONFIG))?;
+        // What stays in misc is asked again on the next start, which is right
+        // for work that outlives one screen and wrong for a request this phone
+        // can never answer: without a second set of partitions there is no
+        // fastbootd to take the port, so the request only keeps sending the
+        // recovery away from itself. It is cleared here and dropped below, and
+        // the recovery carries on with its own screen.
+        let unanswered = matches!(request.work, bcb::Work::Fastboot) && !cfg.device.ab;
+        if !request.work.lasts() || unanswered {
             bcb::clear(&misc)?;
         }
-        let cfg = DeviceConfig::load(Path::new("/").join(ramdisk::CONFIG))?;
+        if unanswered {
+            request = bcb::Request::default();
+        }
         skyward_sys::kmsg(&format!(
             "{} {} recovery up, misc command {:?} args {:?}, asking for {:?}",
             cfg.device.codename,
@@ -704,6 +818,7 @@ fn recovery() -> Result<()> {
             message.args,
             request.work
         ))?;
+        eprintln!("misc asked for {:?}", request.work);
         if !request.unknown.is_empty() {
             skyward_sys::kmsg(&format!("misc arguments this recovery does not know: {:?}", request.unknown))?;
         }
@@ -748,7 +863,7 @@ fn recovery() -> Result<()> {
             // erasing them, which may take super with them, and undoing
             // shared blocks, which writes to the slot's own.
             if !matches!(request.work, bcb::Work::Fastboot | bcb::Work::WipeAb { .. } | bcb::Work::UnshareBlocks) {
-                prepare(&cfg, booted_slot()?)?;
+                prepare(&cfg, skyward_vab::current_slot()?)?;
             }
             let root = Path::new("/");
             ui::run(&cfg, &root.join(ramdisk::FONT), &root.join(ramdisk::MONO), request, Screen::Home, None)
@@ -767,7 +882,15 @@ fn recovery() -> Result<()> {
 /// from them. Recovery has to stay usable when super cannot be mounted, as
 /// after it is wiped, so the reason goes to the kernel log instead.
 #[cfg(target_os = "android")]
-fn prepare(cfg: &DeviceConfig, slot: skyward_vab::Slot) -> Result<()> {
+fn prepare(cfg: &DeviceConfig, slot: Option<skyward_vab::Slot>) -> Result<()> {
+    // A phone without slots keeps one copy of each partition, named as its
+    // own by-name links give them. There is no super to map and nothing runs
+    // from a slot; what this function does besides that is the module,
+    // firmware and service setup the configuration asks for, and on these
+    // older Qualcomm phones the kernel carries all of it already.
+    let Some(slot) = slot else {
+        return skyward_sys::kmsg("no slots on this phone: nothing to map or bring up");
+    };
     match skyward_vab::mount_partitions(slot) {
         Ok(mounts) => {
             for d in &mounts.damaged {
@@ -785,6 +908,257 @@ fn prepare(cfg: &DeviceConfig, slot: skyward_vab::Slot) -> Result<()> {
         Err(e) => skyward_sys::kmsg(&format!("partitions not mounted: {e:#}"))?,
     }
     Ok(())
+}
+
+/// Start the phone's key hardware service and ask it about itself. What it
+/// answers proves the whole chain — the vendor files, the secure world's
+/// daemon, the service's own registration, and the way this program writes a
+/// call in the older layout — before anything that needs a key is asked of
+/// it, and it takes nothing and changes nothing.
+/// Say where a fault happened, instead of letting the kernel take the
+/// process without a word: a module that dereferences nothing is read from
+/// the program counter it faulted at, which names the function and how far
+/// into it the fault was.
+#[cfg(target_os = "android")]
+fn catch_faults() {
+    unsafe extern "C" fn handler(signal: libc::c_int, info: *mut libc::siginfo_t, ctx: *mut libc::c_void) {
+        let addr = match info.is_null() {
+            true => 0,
+            false => unsafe { (*info).si_addr() as usize },
+        };
+        let pc = match ctx.is_null() {
+            true => 0,
+            false => unsafe { (*(ctx as *const libc::ucontext_t)).uc_mcontext.pc as usize },
+        };
+        let said = format!("FAULT {signal} at {addr:#x}, pc {pc:#x}\n");
+        unsafe {
+            libc::write(2, said.as_ptr().cast(), said.len());
+        }
+        // Which library the program counter is in, and how far into it: the
+        // module's own symbols are at known offsets from its base.
+        if let Ok(maps) = std::fs::read_to_string("/proc/self/maps") {
+            for line in maps.lines() {
+                let mut parts = line.split_whitespace();
+                let (Some(range), Some(path)) = (parts.next(), parts.last()) else {
+                    continue;
+                };
+                let Some((low, high)) = range.split_once('-') else {
+                    continue;
+                };
+                let (Ok(low), Ok(high)) = (usize::from_str_radix(low, 16), usize::from_str_radix(high, 16)) else {
+                    continue;
+                };
+                if pc >= low && pc < high {
+                    let said = format!("  in {path} base {low:#x} offset {:#x}\n", pc - low);
+                    unsafe {
+                        libc::write(2, said.as_ptr().cast(), said.len());
+                    }
+                }
+            }
+        }
+        unsafe { libc::_exit(70) };
+    }
+    let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
+    action.sa_sigaction = handler as *const () as usize;
+    action.sa_flags = libc::SA_SIGINFO;
+    unsafe {
+        libc::sigaction(libc::SIGSEGV, &action, std::ptr::null_mut());
+        libc::sigaction(libc::SIGBUS, &action, std::ptr::null_mut());
+    }
+}
+
+/// Open the data partition as the decrypt page does, and say how far it got.
+/// What a pattern comes to, as the phone keeps it: the dots themselves, each
+/// numbered from nought, in the order the finger joins them. `12369` is the
+/// pattern that goes 1, 2, 3, 6, 9, and is 0, 1, 2, 5, 8.
+#[cfg(target_os = "android")]
+fn pattern_bytes(dots: &str) -> Result<Vec<u8>> {
+    let mut said = Vec::new();
+    for dot in dots.chars().filter(|c| c.is_ascii_digit()) {
+        let at = dot as u8 - b'1';
+        anyhow::ensure!(at < 9, "a pattern joins dots numbered 1 to 9, and {dot} is not one of them");
+        // The credential a pattern makes is the digits it is drawn on, each
+        // dot turned into `'1' + dot` — which is what the phone keeps, and
+        // what it stretches. The dots themselves are a different thing.
+        said.push(b'1' + at);
+    }
+    Ok(said)
+}
+
+#[cfg(target_os = "android")]
+fn opendata() -> Result<()> {
+    catch_faults();
+    let _chain = keyhal::start();
+    let binder = skyward_binder::driver::Binder::open()?;
+    let service = skyward_crypto::keymint::KeyMint::open(&binder)?;
+    match skyward_crypto::data::open_without_credential(&service) {
+        Ok(opening) => {
+            println!("the data partition is open");
+            if let Some(mounted) = &opening.mounted {
+                println!("  mounted {} as {}", mounted.mapped.display(), mounted.filesystem);
+            }
+            for closed in &opening.closed {
+                println!("  user {} still closed: {:?}", closed.user, closed.why);
+            }
+            // What the phone's own files look like from here: a few names of
+            // the places a user's things are kept, which is the whole point of
+            // opening it.
+            for at in ["/data/data", "/data/media/0", "/data/system"] {
+                match std::fs::read_dir(at) {
+                    Ok(read) => {
+                        let names: Vec<String> = read.flatten().take(3).map(|e| e.file_name().to_string_lossy().into_owned()).collect();
+                        println!("  {at}: {names:?}");
+                    }
+                    Err(e) => println!("  {at}: {e}"),
+                }
+            }
+            Ok(())
+        }
+        Err(e) => {
+            println!("the data partition stays closed: {e:#}");
+            Ok(())
+        }
+    }
+}
+
+#[cfg(not(target_os = "android"))]
+fn opendata() -> Result<()> {
+    anyhow::bail!("the data partition is only reachable on the phone")
+}
+
+/// Let the shared key in at a length of the caller's choosing and show a few
+/// names of a folder: names that read as words are a folder whose key the
+/// kernel found, and names that do not are one whose key it did not.
+#[cfg(target_os = "android")]
+fn trykey(key: PathBuf, name: Option<String>, mode: u32, size: usize, dir: PathBuf) -> Result<()> {
+    catch_faults();
+    let _chain = keyhal::start();
+    let binder = skyward_binder::driver::Binder::open()?;
+    let service = skyward_crypto::keymint::KeyMint::open(&binder)?;
+    let (raw, _) = skyward_crypto::data::key_in(&service, &key)?;
+    let own = skyward_crypto::fscrypt::own_name(&raw);
+    let recorded = match &name {
+        Some(said) => {
+            let said: Vec<char> = said.chars().filter(|c| c.is_ascii_hexdigit()).collect();
+            said.chunks(2).map(|pair| u8::from_str_radix(&pair.iter().collect::<String>(), 16)).collect::<std::result::Result<Vec<u8>, _>>()?
+        }
+        None => own.clone(),
+    };
+    println!("the key in {} is {} bytes, and its own hash names it {}", key.display(), raw.len(), skyward_crypto::fscrypt::hex(&own));
+    println!("  let in as {} as mode {mode}, {size} of it", skyward_crypto::fscrypt::hex(&recorded));
+    skyward_crypto::fscrypt::add_key_trying(&raw, &recorded, mode, size)?;
+    match std::fs::read_dir(&dir) {
+        Ok(read) => {
+            let names: Vec<String> = read.flatten().take(4).map(|e| e.file_name().to_string_lossy().into_owned()).collect();
+            println!("{}: {names:?}", dir.display());
+        }
+        Err(e) => println!("{}: {e}", dir.display()),
+    }
+    Ok(())
+}
+
+/// Report how each folder is encrypted, and show a few of its names: names
+/// that read as words are a folder whose key is in, and names that do not
+/// are one whose key the kernel could not find.
+#[cfg(target_os = "android")]
+fn pol(dirs: Vec<PathBuf>) -> Result<()> {
+    let dirs: Vec<PathBuf> = match dirs.is_empty() {
+        true => ["/data", "/data/misc", "/data/app", "/data/system", "/data/user/0", "/data/media", "/data/media/0"].iter().map(PathBuf::from).collect(),
+        false => dirs,
+    };
+    for said in ["/data/unencrypted/ref", "/data/unencrypted/mode"] {
+        match std::fs::read(said) {
+            Ok(raw) => println!("{:<20} {}", said, skyward_crypto::fscrypt::hex(&raw).replace(" ", "")),
+            Err(e) => println!("{said:<20} {e}"),
+        }
+    }
+    for dir in &dirs {
+        println!("{:<20} {}", dir.display(), skyward_crypto::fscrypt::describe(dir));
+        match std::fs::read_dir(dir) {
+            Ok(read) => {
+                let names: Vec<String> = read.flatten().take(3).map(|e| e.file_name().to_string_lossy().into_owned()).collect();
+                println!("{:<20}   {names:?}", "");
+            }
+            Err(e) => println!("{:<20}   {e}", ""),
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "android")]
+fn keytest(list: bool, legacy: bool, blob: Option<String>, skip: usize, make: bool) -> Result<()> {
+    if legacy {
+        catch_faults();
+        // A blob of nothing is not a key: what the hardware answers to it
+        // proves the whole call path — the module, the device, the offset
+        // the function sits at, and the way its arguments are written —
+        // without a key or a credential being touched.
+        let hardware = skyward_crypto::keymaster1::Keymaster1::open()?;
+        println!("the key hardware is loaded");
+        if make {
+            let made = hardware.generate_aes_gcm(256, &[])?;
+            println!("a key of the hardware's own: {} bytes", made.len());
+            println!("  head {:#04x?}", &made[..made.len().min(24)]);
+            println!("asking about the hardware's own blob:");
+            match hardware.authorizations(&made, &[]) {
+                Ok(tags) => {
+                    for (tag, value) in tags {
+                        println!("  {:#010x} {:<16} {value}", tag, skyward_crypto::keymaster1::tag_name(tag));
+                    }
+                }
+                Err(e) => println!("  refused: {e:#}"),
+            }
+            return Ok(());
+        }
+        if let Some(path) = blob {
+            let raw = std::fs::read(&path).with_context(|| format!("read {path}"))?;
+            let key = &raw[skip.min(raw.len())..];
+            println!("{path}: {} bytes, {skip} left out", raw.len());
+            match hardware.authorizations(key, &[]) {
+                Ok(tags) => {
+                    for (tag, value) in tags {
+                        println!("  {:#010x} {:<16} {value}", tag, skyward_crypto::keymaster1::tag_name(tag));
+                    }
+                }
+                Err(e) => println!("  refused: {e:#}"),
+            }
+            return Ok(());
+        }
+        match hardware.authorizations(&[0u8; 32], &[]) {
+            Ok(tags) => {
+                println!("it took a blob of zeros as a key, which it should not have:");
+                for (tag, value) in tags {
+                    println!("  {:#010x} {:<16} {value}", tag, skyward_crypto::keymaster1::tag_name(tag));
+                }
+            }
+            Err(e) => println!("a blob of zeros is refused: {e:#}"),
+        }
+        return Ok(());
+    }
+    if list {
+        let hardware = skyward_binder::driver::Binder::hardware()?;
+        for name in skyward_crypto::keymaster::registered(&hardware)? {
+            println!("{name}");
+        }
+        return Ok(());
+    }
+    let mut started = keyhal::start()?;
+    let hardware = skyward_binder::driver::Binder::hardware()?;
+    let service = skyward_crypto::keymaster::Keymaster::open(&hardware)?;
+    let said = service.hardware()?;
+    println!("version        = {}", said.version);
+    println!("security_level = {}", said.security_level);
+    println!("name           = {}", said.name);
+    println!("author         = {}", said.author);
+    for (what, code) in started.still_up() {
+        println!("gone           = {what} exited with {code:?}");
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "android"))]
+fn keytest(_list: bool, _legacy: bool, _blob: Option<String>, _skip: usize, _make: bool) -> Result<()> {
+    anyhow::bail!("the key hardware is only reachable on the phone")
 }
 
 fn info(config: &str) -> Result<()> {
@@ -812,7 +1186,9 @@ fn info(config: &str) -> Result<()> {
     println!("snapshot      = {snap:?}");
     match snap {
         SnapshotState::None => {}
-        SnapshotState::Unknown => println!("  -> /metadata is not mounted; dynamic-partition writes stay refused"),
+        SnapshotState::Unknown => {
+            println!("  -> /metadata is not mounted; dynamic-partition writes stay refused")
+        }
         _ => println!("  -> dynamic-partition writes are refused while a snapshot is outstanding"),
     }
     let parts = skyward_block::list_by_name(skyward_block::BY_NAME)?;
@@ -846,7 +1222,7 @@ fn identify(path: &Path) -> Result<()> {
                 println!("it brings its own init_boot image");
             }
         }
-        Package::Unknown => println!("nothing this recovery installs"),
+        Package::Unknown(why) => println!("nothing this recovery installs, {why}"),
     }
     Ok(())
 }
@@ -889,7 +1265,10 @@ fn update() -> Result<()> {
     };
     let u = snaps.update()?;
     println!("state {:?} phase {:?} failure {:?}", snaps.state()?, u.merge_phase, u.merge_failure_code);
-    println!("snapuserd {} userspace {} allocated {} total {} metadata {}", u.using_snapuserd, u.userspace_snapshots, u.sectors_allocated, u.total_sectors, u.metadata_sectors);
+    println!(
+        "snapuserd {} userspace {} allocated {} total {} metadata {}",
+        u.using_snapuserd, u.userspace_snapshots, u.sectors_allocated, u.total_sectors, u.metadata_sectors
+    );
     println!("from {:?}, {:?} for {}, built {:?}", snaps.source()?, snaps.side(slot)?, slot.suffix(), u.source_build_fingerprint);
     println!("needed {}", snaps.needed(slot)?);
     for name in snaps.list()? {

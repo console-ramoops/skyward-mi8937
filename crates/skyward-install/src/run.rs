@@ -104,18 +104,12 @@ impl Installer {
         Installer::spawn(Origin::Computer, detach, options, rescue)
     }
 
-    fn spawn(
-        origin: Origin,
-        detach: Detach,
-        options: Options,
-        work: impl FnOnce(&mut Context) -> Outcome + Send + 'static,
-    ) -> Result<Installer> {
+    fn spawn(origin: Origin, detach: Detach, options: Options, work: impl FnOnce(&mut Context) -> Outcome + Send + 'static) -> Result<Installer> {
         let (wake, signal) = pipe(libc::O_NONBLOCK)?;
         let (event_tx, events) = mpsc::channel();
         let (commands, command_rx) = mpsc::channel();
         let shared = Arc::new(Shared::default());
-        let mut ctx =
-            Context { events: event_tx, signal, commands: command_rx, shared: shared.clone(), detach: Some(detach), options, origin };
+        let mut ctx = Context { events: event_tx, signal, commands: command_rx, shared: shared.clone(), detach: Some(detach), options, origin };
         let thread = thread::Builder::new()
             .name("installer".into())
             .spawn(move || {
@@ -138,11 +132,11 @@ impl Installer {
         self.events.try_iter().collect()
     }
 
-    /// Write the image the installer holds to `partition` in `slots`.
-    pub fn flash(&self, partition: &'static str, slots: Vec<Slot>) {
+    /// Write the image the installer holds to `partition` at `devices`.
+    pub fn flash(&self, partition: &'static str, devices: Vec<PathBuf>) {
         // Only a finished installer stops listening, and then there is
         // nothing left to write.
-        let _ = self.commands.send(Command::Flash { partition, slots });
+        let _ = self.commands.send(Command::Flash { partition, devices });
     }
 
     /// Install the update the installer holds.
@@ -254,7 +248,10 @@ enum Done {
     Engine(i32),
     /// The install script ended with this status; `wipe_cache` when it
     /// asked for the cache partition to be erased after.
-    Script { code: i32, wipe_cache: bool },
+    Script {
+        code: i32,
+        wipe_cache: bool,
+    },
     Error(anyhow::Error),
 }
 
@@ -460,7 +457,7 @@ fn install<S>(ctx: &mut Context, mount: &Mount<S>, size: u64) -> Result<Done> {
         Package::Image(kind) => flash_image(ctx, kind, size),
         Package::Script => run_script(ctx, size),
         Package::System(contents) => install_system(ctx, &contents),
-        Package::Unknown => Ok(Done::Decided(Outcome::Refused(Refusal::Unknown))),
+        Package::Unknown(_) => Ok(Done::Decided(Outcome::Refused(Refusal::Unknown))),
     }
 }
 
@@ -506,7 +503,8 @@ fn install_system(ctx: &Context, contents: &skyward_systems::package::Contents) 
     ensure!(sizes.contains(&size), "{size} bytes is not among the sizes offered, {sizes:?}");
     let program = Path::new("/").join(skyward_config::ramdisk::SYSTEM_INIT);
     let program = fs::read(&program).with_context(|| format!("read {}", program.display()))?;
-    let mut zip = zip::ZipArchive::new(BufReader::with_capacity(1 << 20, File::open(fuse::PACKAGE).context("open the package")?)).context("read the package")?;
+    let mut zip =
+        zip::ZipArchive::new(BufReader::with_capacity(1 << 20, File::open(fuse::PACKAGE).context("open the package")?)).context("read the package")?;
     let mut told: Option<Instant> = None;
     skyward_systems::install::install(&mut zip, contents, size, &program, slot, &mut |step| {
         let stage = match step {
@@ -572,7 +570,7 @@ fn describe(package: &Package) -> String {
         Package::Image(kind) => format!("an image of {kind:?}"),
         Package::Script => "a zip with an install script".into(),
         Package::System(c) => format!("the system {} {}, to install beside the installed one", c.manifest.name, c.manifest.version),
-        Package::Unknown => "a file of no known kind".into(),
+        Package::Unknown(why) => format!("a file of no known kind: {why}"),
     }
 }
 
@@ -603,7 +601,7 @@ fn update_system<S>(ctx: &mut Context, mount: &Mount<S>, update: &Update) -> Res
         }
     }
     ctx.send(Event::Installing { version });
-    let kept = hold(ctx, slot)?;
+    let kept = hold(ctx, Some(slot))?;
     installed_boot_set()?;
     detach_once(ctx)?;
     // update_engine mounts /metadata itself, as in the stock recovery, keeps
@@ -631,10 +629,17 @@ fn update_system<S>(ctx: &mut Context, mount: &Mount<S>, update: &Update) -> Res
 /// This recovery, held before an install writes, when the screen asked to
 /// keep it in the recovery partitions; none when it was started without
 /// being flashed.
-fn hold(ctx: &Context, current: Slot) -> Result<Option<Kept>> {
+fn hold(ctx: &Context, current: Option<Slot>) -> Result<Option<Kept>> {
     if !ctx.options.keep {
         return Ok(None);
     }
+    // What is kept is this recovery as the partition of the slot that
+    // starts holds it, and where the phone has one set of partitions there
+    // is no other set to come back to: the page leaves the choice out.
+    let Some(current) = current else {
+        let _ = kmsg("install: a phone with one set of partitions keeps no recovery of its own");
+        return Ok(None);
+    };
     let kept = Kept::hold(Path::new(skyward_block::BY_NAME), current).context("hold this recovery from its partition")?;
     if kept.is_none() {
         let _ = kmsg("install: the recovery partition does not hold Skyward, so there is none to keep");
@@ -677,17 +682,12 @@ fn remount_metadata() -> Result<()> {
 fn phone(slot: Slot) -> Result<Phone> {
     let props = skyward_info::installed_props(slot)?;
     let installed = match (props.get("ro.build.date.utc"), props.get("ro.build.version.security_patch")) {
-        (Some(time), Some(patch)) => Some(Build {
-            timestamp: time.parse().with_context(|| format!("ro.build.date.utc {time:?}"))?,
-            security_patch: patch.clone(),
-        }),
+        (Some(time), Some(patch)) => {
+            Some(Build { timestamp: time.parse().with_context(|| format!("ro.build.date.utc {time:?}"))?, security_patch: patch.clone() })
+        }
         _ => None,
     };
-    Ok(Phone {
-        device: prop("ro.product.device").context("ro.product.device is unset")?,
-        serial: prop("ro.serialno").unwrap_or_default(),
-        installed,
-    })
+    Ok(Phone { device: prop("ro.product.device").context("ro.product.device is unset")?, serial: prop("ro.serialno").unwrap_or_default(), installed })
 }
 
 /// Why there is too little charge to install, if there is.
@@ -707,11 +707,7 @@ fn apply<S>(ctx: &Context, mount: &Mount<S>, update: &Update) -> Result<i32> {
     let (status_read, status_write) = pipe(0)?;
     let status_fd = status_write.as_raw_fd();
     let mut command = std::process::Command::new(ota::PROGRAM);
-    command
-        .args(ota::arguments(fuse::PACKAGE, update, status_fd))
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped());
+    command.args(ota::arguments(fuse::PACKAGE, update, status_fd)).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::piped());
     // The program keeps its end of the status pipe across exec.
     unsafe {
         command.pre_exec(move || {
@@ -801,22 +797,21 @@ fn lines(from: impl Read, mut each: impl FnMut(&str) -> io::Result<()>) -> io::R
 
 fn flash_image(ctx: &Context, kind: ImageKind, size: u64) -> Result<Done> {
     let dir = Path::new(skyward_block::BY_NAME);
-    let partitions = image::partitions(kind, dir)?;
+    let partitions = image::partitions(kind, dir, skyward_vab::current_slot()?)?;
     if partitions.is_empty() {
         return Ok(Done::Decided(Outcome::Refused(Refusal::NoPartition)));
     }
     ctx.send(Event::Image { kind, size, partitions: partitions.clone() });
-    let (partition, slots) = match ctx.commands.recv() {
-        Ok(Command::Flash { partition, slots }) => (partition, slots),
+    let (partition, devices) = match ctx.commands.recv() {
+        Ok(Command::Flash { partition, devices }) => (partition, devices),
         Ok(Command::Cancel) | Err(_) => return Ok(Done::Decided(Outcome::Cancelled)),
         Ok(other) => bail!("an image waiting for its partition was told {other:?}"),
     };
     ensure!(partitions.contains(&partition), "{partition} is not among {partitions:?}");
-    ensure!(!slots.is_empty(), "no slot chosen for {partition}");
-    if [skyward_systems::store::BOOT, skyward_systems::store::INIT_BOOT].contains(&partition) {
+    ensure!(!devices.is_empty(), "no partition chosen for {partition}");
+    if partition == skyward_systems::store::BOOT || partition == skyward_systems::store::INIT_BOOT {
         installed_boot_set()?;
     }
-    let devices: Vec<_> = slots.iter().map(|&slot| image::device(dir, partition, slot)).collect();
     let mut file = BufReader::with_capacity(1 << 20, File::open(fuse::PACKAGE).context("open the package")?);
     let mut told: Option<Instant> = None;
     image::flash(&mut file, size, &devices, &mut |done, total| {
@@ -825,7 +820,7 @@ fn flash_image(ctx: &Context, kind: ImageKind, size: u64) -> Result<Done> {
             told = Some(Instant::now());
         }
     })?;
-    Ok(Done::Decided(Outcome::Flashed { partition, slots }))
+    Ok(Done::Decided(Outcome::Flashed { partition, devices }))
 }
 
 /// Run the install script of the zip being served, `size` bytes, once the
@@ -860,20 +855,22 @@ fn run_script(ctx: &mut Context, size: u64) -> Result<Done> {
             Ok(other) => bail!("a script waiting to be agreed to was told {other:?}"),
         }
     }
-    let slot = skyward_vab::current_slot()?.context("not an A/B phone")?;
+    let slot = skyward_vab::current_slot()?;
     extract_script()?;
     shell_at_sbin()?;
     let kept = hold(ctx, slot)?;
     installed_boot_set()?;
     detach_once(ctx)?;
     // While an update is in flight, the slot's partitions in super are its
-    // and stay unmapped.
-    let mapped = match skyward_vab::snapshot_state()? {
-        SnapshotState::None => skyward_vab::map_slot(slot)?,
-        state => {
+    // and stay unmapped; a phone with one set of partitions has nothing to
+    // map at all, since its links reach every one of them whole.
+    let mapped = match (slot, skyward_vab::snapshot_state()?) {
+        (Some(slot), SnapshotState::None) => skyward_vab::map_slot(slot)?,
+        (Some(_), state) => {
             let _ = kmsg(&format!("install: the slot's partitions stay unmapped while an update is in flight ({state:?})"));
             SlotMaps::default()
         }
+        (None, _) => SlotMaps::default(),
     };
     let mounted = skyward_block::mount::mount_ids()?;
     let ran = run_binary(ctx);

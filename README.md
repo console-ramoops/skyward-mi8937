@@ -122,6 +122,10 @@ the data partition.
 
 ## Installing Skyward
 
+For the experimental unified **Mi-Thorium `mi8937_4_19`** port, including its
+base-image requirements and build instructions, see
+[the port guide](docs/mi8937_4_19.md).
+
 Skyward needs an unlocked bootloader. Download the zip for your phone from
 [Releases](https://github.com/kirklin/skyward/releases), where each shows as the
 phone's model and codename, such as Xiaomi 17 Ultra (nezha). Check it against
